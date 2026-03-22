@@ -1,0 +1,14 @@
+# Node / Tauri
+desktop/node_modules/
+desktop/src-tauri/target/
+
+# Runtime data
+*.log
+*.pid
+*.jsonl
+.DS_Store
+
+# Generated local state
+workspace/
+data/
+output/
