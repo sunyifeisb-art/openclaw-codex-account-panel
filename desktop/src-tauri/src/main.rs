@@ -38,6 +38,31 @@ fn pid_is_running(pid: u32) -> bool {
     .unwrap_or(false)
 }
 
+fn auth_store_path() -> Result<PathBuf, String> {
+  let home = env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+  Ok(PathBuf::from(home).join(".openclaw").join("agents").join("main").join("agent").join("auth-profiles.json"))
+}
+
+fn has_node_runtime() -> bool {
+  Command::new("node")
+    .arg("--version")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
+}
+
+fn has_openclaw_cli() -> bool {
+  Command::new("openclaw")
+    .arg("--version")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
+}
+
 fn resource_paths() -> Option<(PathBuf, PathBuf)> {
   let exe = env::current_exe().ok()?;
   let resource_dir = exe.parent()?.parent()?.join("Resources");
@@ -53,6 +78,17 @@ fn resource_paths() -> Option<(PathBuf, PathBuf)> {
 fn ensure_server_running() -> Result<(), String> {
   if is_port_open() {
     return Ok(());
+  }
+
+  if !has_node_runtime() {
+    return Err("未检测到 node 运行时。这个桌面版面向已经在本机使用 OpenClaw 的用户；请先确认本机能正常运行 OpenClaw。".into());
+  }
+  if !has_openclaw_cli() {
+    return Err("未检测到 openclaw 命令。请先在这台 Mac 上安装并配置 OpenClaw。".into());
+  }
+  let auth_path = auth_store_path()?;
+  if !auth_path.exists() {
+    return Err(format!("未找到 OpenClaw 账号数据：{}。请先在本机用 OpenClaw 登录至少一个 Codex 账号。", auth_path.display()));
   }
 
   let workspace_root = resolve_workspace_root()?;
@@ -118,9 +154,13 @@ fn ensure_server_running() -> Result<(), String> {
 fn main() {
   tauri::Builder::default()
     .setup(|app| {
-      ensure_server_running().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+      let startup_ok = ensure_server_running().is_ok();
+      let url = if startup_ok {
+        WebviewUrl::External(format!("http://127.0.0.1:{PORT}").parse()?)
+      } else {
+        WebviewUrl::App("help.html".into())
+      };
 
-      let url = WebviewUrl::External(format!("http://127.0.0.1:{PORT}").parse()?) ;
       let _window = WebviewWindowBuilder::new(app, "main", url)
         .title("OpenClaw Codex Panel")
         .inner_size(1320.0, 920.0)

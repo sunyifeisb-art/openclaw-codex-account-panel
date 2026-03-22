@@ -14,11 +14,18 @@
 - `desktop/`：Tauri 桌面壳
 - `scripts/openclaw_codex_add_profile.mjs`：新增 Codex OAuth 账号的辅助脚本
 
+## 目标用户
+
+这个项目当前的目标用户是：**已经在本机安装并使用 OpenClaw 的用户**。
+
+它不是“完全零配置”的独立新手版；更准确地说，它是 OpenClaw / Codex 多账号场景的本地可视化面板。
+
 ## 运行前提
 
-- macOS
+- macOS（当前 Release 提供 Apple Silicon 包）
 - 已安装并登录 OpenClaw
 - 已存在 `~/.openclaw/agents/main/agent/auth-profiles.json`
+- 已在 OpenClaw 中登录过至少 1 个 Codex 账号
 - Node.js 20+
 - Rust / Cargo（如果要构建桌面 App）
 
@@ -75,6 +82,7 @@ MIT
 
 ## 下载
 
-- 对普通 macOS（Apple Silicon）用户，优先下载 Releases 里的 `.dmg` 安装包。
+- 如果你已经是 OpenClaw 用户，优先下载 Releases 里的 `.dmg` 安装包。
+- 第一次启动前，请先确认本机 `openclaw`、`node` 和 Codex 登录数据都已就绪。
 - 如果系统拦截未签名应用，请在“系统设置 → 隐私与安全性”里允许打开，或右键应用选择“打开”。
 
