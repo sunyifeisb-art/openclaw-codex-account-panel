@@ -7,10 +7,11 @@ import { spawn } from 'node:child_process';
 
 const PORT = Number(process.env.CODEX_PANEL_PORT || 7071);
 const WORKSPACE = process.env.OPENCLAW_WORKSPACE || path.join(os.homedir(), '.openclaw', 'workspace');
-const DATA_DIR = path.join(WORKSPACE, 'data');
+const PANEL_HOME = process.env.OPENCLAW_CODEX_PANEL_HOME || WORKSPACE;
+const DATA_DIR = path.join(PANEL_HOME, 'data');
 const AUTH_PATH = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
 const CALL_LOG_PATH = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'agent', 'codex-profile-usage.jsonl');
-const LOGIN_SCRIPT = path.join(WORKSPACE, 'scripts', 'openclaw_codex_add_profile.mjs');
+const LOGIN_SCRIPT = process.env.OPENCLAW_CODEX_LOGIN_SCRIPT || path.join(WORKSPACE, 'scripts', 'openclaw_codex_add_profile.mjs');
 const PANEL_STATE_PATH = path.join(DATA_DIR, 'codex-panel-state.json');
 const LOGIN_LOG_PATH = path.join(DATA_DIR, 'codex-panel-login.log');
 const LOGIN_TRIGGER_PATH = path.join(DATA_DIR, 'codex-panel-last-launch.txt');

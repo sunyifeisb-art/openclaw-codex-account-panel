@@ -38,15 +38,32 @@ fn pid_is_running(pid: u32) -> bool {
     .unwrap_or(false)
 }
 
+fn resource_paths() -> Option<(PathBuf, PathBuf)> {
+  let exe = env::current_exe().ok()?;
+  let resource_dir = exe.parent()?.parent()?.join("Resources");
+  let server_path = resource_dir.join("panel").join("server.mjs");
+  let login_script = resource_dir.join("scripts").join("openclaw_codex_add_profile.mjs");
+  if server_path.exists() && login_script.exists() {
+    Some((server_path, login_script))
+  } else {
+    None
+  }
+}
+
 fn ensure_server_running() -> Result<(), String> {
   if is_port_open() {
     return Ok(());
   }
 
-  let root = resolve_workspace_root()?;
-  let server_path = root.join("apps").join("codex-account-panel").join("server.mjs");
-  let log_path = root.join("output").join("codex-account-panel.log");
-  let pid_path = root.join("data").join("codex-account-panel.pid");
+  let workspace_root = resolve_workspace_root()?;
+  let panel_home = workspace_root.join("codex-account-panel");
+  let log_path = panel_home.join("output").join("codex-account-panel.log");
+  let pid_path = panel_home.join("data").join("codex-account-panel.pid");
+  let (server_path, login_script_path) = resource_paths()
+    .unwrap_or((
+      workspace_root.join("apps").join("codex-account-panel").join("server.mjs"),
+      workspace_root.join("scripts").join("openclaw_codex_add_profile.mjs"),
+    ));
 
   if let Ok(pid_raw) = fs::read_to_string(&pid_path) {
     if let Ok(pid) = pid_raw.trim().parse::<u32>() {
@@ -61,8 +78,8 @@ fn ensure_server_running() -> Result<(), String> {
     }
   }
 
-  fs::create_dir_all(root.join("output")).map_err(|e| e.to_string())?;
-  fs::create_dir_all(root.join("data")).map_err(|e| e.to_string())?;
+  fs::create_dir_all(panel_home.join("output")).map_err(|e| e.to_string())?;
+  fs::create_dir_all(panel_home.join("data")).map_err(|e| e.to_string())?;
 
   let stdout = OpenOptions::new()
     .create(true)
@@ -77,7 +94,10 @@ fn ensure_server_running() -> Result<(), String> {
 
   let child = Command::new("node")
     .arg(&server_path)
-    .current_dir(&root)
+    .current_dir(&workspace_root)
+    .env("OPENCLAW_WORKSPACE", &workspace_root)
+    .env("OPENCLAW_CODEX_PANEL_HOME", &panel_home)
+    .env("OPENCLAW_CODEX_LOGIN_SCRIPT", &login_script_path)
     .stdout(Stdio::from(stdout))
     .stderr(Stdio::from(stderr))
     .spawn()

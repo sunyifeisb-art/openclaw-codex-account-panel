@@ -1,6 +1,6 @@
 # OpenClaw Codex Account Panel
 
-一个给 OpenClaw / Codex OAuth 多账号轮换场景用的本地面板。
+一个给 OpenClaw / Codex OAuth 多账号轮换场景用的本地面板与桌面 App。
 
 它提供三块核心能力：
 
@@ -72,3 +72,9 @@ node scripts/openclaw_codex_add_profile.mjs
 ## License
 
 MIT
+
+## 下载
+
+- 对普通 macOS（Apple Silicon）用户，优先下载 Releases 里的 `.dmg` 安装包。
+- 如果系统拦截未签名应用，请在“系统设置 → 隐私与安全性”里允许打开，或右键应用选择“打开”。
+
