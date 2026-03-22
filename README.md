@@ -8,6 +8,10 @@
 - 查看每个账号的 Codex 额度（5h / 1周）
 - 查看按天聚合的实际调用记录：命中账号、调用次数、总时长、最近调用明细
 
+## 面板预览
+
+![OpenClaw Codex Panel preview](./docs/panel-preview.png)
+
 ## 目录结构
 
 - `panel/server.mjs`：本地 HTTP 面板服务
