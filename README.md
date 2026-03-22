@@ -10,7 +10,7 @@
 
 ## 面板预览
 
-![OpenClaw Codex Panel preview](./docs/panel-preview-redacted-v2.png)
+![OpenClaw Codex Panel preview](./docs/panel-preview-redacted-v3.png)
 
 ## 目录结构
 
