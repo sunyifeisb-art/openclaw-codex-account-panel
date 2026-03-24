@@ -1,6 +1,6 @@
-# OpenClaw Codex Account Panel
+# OpenClaw Panel
 
-一个给 OpenClaw / Codex OAuth 多账号轮换场景用的本地面板与桌面 App。
+一个给 OpenClaw / Codex OAuth 多账号轮换场景用的本地面板与桌面 App（原名 OpenClaw Codex Account Panel）。
 
 它现在已经不是一个只看账号列表的小工具，而是一个完整的本地运维面板，覆盖：
 

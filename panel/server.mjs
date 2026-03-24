@@ -14,6 +14,7 @@ const AUTH_PATH = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'agent'
 const CALL_LOG_PATH = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'agent', 'codex-profile-usage.jsonl');
 const LOGIN_SCRIPT = path.join(WORKSPACE, 'scripts', 'openclaw_codex_add_profile.mjs');
 const PANEL_STATE_PATH = path.join(DATA_DIR, 'codex-panel-state.json');
+const PANEL_PREFERENCES_PATH = path.join(DATA_DIR, 'codex-panel-preferences.json');
 const LOGIN_LOG_PATH = path.join(DATA_DIR, 'codex-panel-login.log');
 const LOGIN_TRIGGER_PATH = path.join(DATA_DIR, 'codex-panel-last-launch.txt');
 const USAGE_CACHE_PATH = path.join(DATA_DIR, 'codex-panel-usage-cache.json');
@@ -55,6 +56,53 @@ function writeUsageCache(next) {
     lastUpdatedAt: Number(next?.lastUpdatedAt || 0) || null,
   };
   fs.writeFileSync(USAGE_CACHE_PATH, JSON.stringify(payload, null, 2) + '\n');
+}
+
+const DEFAULT_PREFERENCES = Object.freeze({
+  launchMode: 'menubar-only',
+  themeMode: 'system',
+  lastMenuRefreshAt: 0,
+});
+
+function normalizeLaunchMode(value) {
+  return ['window-only', 'menubar-only', 'window-and-menubar'].includes(value)
+    ? value
+    : DEFAULT_PREFERENCES.launchMode;
+}
+
+function normalizeThemeMode(value) {
+  return ['system', 'light', 'dark'].includes(value)
+    ? value
+    : DEFAULT_PREFERENCES.themeMode;
+}
+
+function normalizePanelPreferences(raw) {
+  return {
+    launchMode: normalizeLaunchMode(raw?.launchMode),
+    themeMode: normalizeThemeMode(raw?.themeMode),
+    lastMenuRefreshAt: Math.max(0, Number(raw?.lastMenuRefreshAt || 0) || 0),
+  };
+}
+
+function readPanelPreferences() {
+  try {
+    return normalizePanelPreferences(JSON.parse(fs.readFileSync(PANEL_PREFERENCES_PATH, 'utf8')));
+  } catch {
+    return { ...DEFAULT_PREFERENCES };
+  }
+}
+
+function writePanelPreferences(next) {
+  fs.writeFileSync(PANEL_PREFERENCES_PATH, JSON.stringify(normalizePanelPreferences(next), null, 2) + '\n');
+}
+
+function deriveLaunchShape(launchModeInput) {
+  const launchMode = normalizeLaunchMode(launchModeInput);
+  return {
+    launchMode,
+    showsWindowOnLaunch: launchMode !== 'menubar-only',
+    enablesMenuBar: launchMode !== 'window-only',
+  };
 }
 
 function clampPercent(value) {
@@ -513,7 +561,100 @@ function buildProfiles() {
     errorCount: visibleProfiles.filter((profile) => profile.usage?.source === 'error').length,
   };
 
-  return { order, lastGood, profiles: visibleProfiles, hiddenProfiles, groups: visibleGroups, usageSummary };
+  return {
+    order,
+    lastGood,
+    profiles: visibleProfiles,
+    hiddenProfiles,
+    groups: visibleGroups,
+    usageSummary,
+    preferences: readPanelPreferences(),
+  };
+}
+
+function resolveCurrentProfile(state) {
+  const allProfiles = [...(state?.profiles || []), ...(state?.hiddenProfiles || [])];
+  if (!allProfiles.length) return null;
+  const byId = new Map(allProfiles.map((profile) => [profile.profileId, profile]));
+  const preferredIds = [
+    state?.lastGood || null,
+    state?.order?.[0] || null,
+    'openai-codex:default',
+  ].filter(Boolean);
+  for (const profileId of preferredIds) {
+    if (byId.has(profileId)) return byId.get(profileId);
+  }
+  return allProfiles[0] || null;
+}
+
+function getCurrentChannel(profileId) {
+  if (!profileId) return null;
+  const candidates = readCodexSessionBindings()
+    .filter((binding) => binding.profileId === profileId)
+    .map((binding) => {
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(binding.sessionFile).mtimeMs || 0;
+      } catch {
+        mtimeMs = 0;
+      }
+      return {
+        channel: binding.messageChannel || normalizeHistoryChannel(null, binding.agentId),
+        mtimeMs,
+      };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return candidates[0]?.channel || null;
+}
+
+function formatUsageWindowText(window) {
+  if (!window) return '暂时不可用';
+  const remaining = Math.max(0, Math.min(100, Math.round(100 - (Number(window.usedPercent || 0) || 0))));
+  const parts = [remaining + '%'];
+  if (window.resetInText) parts.push(window.resetInText);
+  return parts.join(' · ');
+}
+
+function buildMenubarSummary() {
+  const state = buildProfiles();
+  const preferences = state.preferences || readPanelPreferences();
+  const currentProfile = resolveCurrentProfile(state);
+  const usage = currentProfile?.usage || {};
+  const fiveHour = (usage.windows || []).find((item) => item.label === '5h') || (usage.windows || [])[0] || null;
+  const weekly = (usage.windows || []).find((item) => item.label === '1周') || (usage.windows || [])[1] || null;
+  const refreshedAt = usage.fetchedAt || state.usageSummary?.latestFetchedAt || preferences.lastMenuRefreshAt || null;
+  return {
+    currentProfile: currentProfile
+      ? {
+          id: currentProfile.profileId,
+          label: currentProfile.email || currentProfile.profileId,
+        }
+      : null,
+    space: currentProfile
+      ? {
+          type: currentProfile.spaceType || null,
+          label: currentProfile.spaceLabel || currentProfile.spaceTypeLabel || '未知空间',
+        }
+      : null,
+    channel: getCurrentChannel(currentProfile?.profileId),
+    usage: {
+      fiveHour: {
+        label: fiveHour?.label || '5h',
+        text: formatUsageWindowText(fiveHour),
+      },
+      weekly: {
+        label: weekly?.label || '1周',
+        text: formatUsageWindowText(weekly),
+      },
+      stale: Boolean(usage?.source === 'cache' || usage?.stale),
+      error: usage?.lastError || null,
+      source: usage?.source || 'none',
+    },
+    refreshedAt,
+    refreshedAtText: formatDateTime(refreshedAt),
+    preferences,
+    launchShape: deriveLaunchShape(preferences.launchMode),
+  };
 }
 
 function formatDurationCompactMs(ms) {
@@ -542,6 +683,17 @@ function shanghaiDateKey(ts = Date.now()) {
 
 function normalizeHistoryDateKey(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) ? String(value) : shanghaiDateKey();
+}
+
+function normalizeHistoryMonthKey(value) {
+  return /^\d{4}-\d{2}$/.test(String(value || '')) ? String(value) : shanghaiDateKey().slice(0, 7);
+}
+
+function shiftHistoryMonthKey(monthKey, deltaMonths) {
+  const [year, month] = String(monthKey || shanghaiDateKey().slice(0, 7)).split('-').map(Number);
+  const dt = new Date(Date.UTC(year, (month || 1) - 1, 1));
+  dt.setUTCMonth(dt.getUTCMonth() + deltaMonths);
+  return dt.toISOString().slice(0, 7);
 }
 
 function formatClockTime(ts) {
@@ -922,6 +1074,131 @@ function readCodexCallHistory(dateKeyInput) {
   };
 }
 
+function mergeHistoryPayloads(items, keyLabel = null) {
+  const byProfile = new Map();
+  const bySpace = new Map();
+  const byChannel = new Map();
+  const events = [];
+  let totalCalls = 0;
+  let totalDurationMs = 0;
+  let totalTokens = 0;
+  let totalCost = 0;
+  let source = 'session-transcript';
+
+  for (const item of items) {
+    totalCalls += Number(item.totalCalls || 0) || 0;
+    totalDurationMs += Number(item.totalDurationMs || 0) || 0;
+    totalTokens += Number(item.totalTokens || 0) || 0;
+    totalCost += Number(item.totalCost || 0) || 0;
+    if (item.source === 'usage-log') source = 'usage-log';
+    for (const row of item.byProfile || []) {
+      const key = row.profileId || row.email || 'unknown';
+      const bucket = byProfile.get(key) || { ...row, calls: 0, totalDurationMs: 0, totalTokens: 0, totalCost: 0 };
+      bucket.calls += Number(row.calls || 0) || 0;
+      bucket.totalDurationMs += Number(row.totalDurationMs || 0) || 0;
+      bucket.totalTokens += Number(row.totalTokens || 0) || 0;
+      bucket.totalCost += Number(row.totalCost || 0) || 0;
+      bucket.lastAt = Math.max(Number(bucket.lastAt || 0) || 0, Number(row.lastAt || 0) || 0);
+      bucket.lastAtText = bucket.lastAt ? formatDateTime(bucket.lastAt) : row.lastAtText;
+      bucket.totalDurationText = bucket.totalDurationMs > 0 ? formatDurationCompactMs(bucket.totalDurationMs) : '—';
+      bucket.totalCostText = bucket.totalCost > 0 ? `$${bucket.totalCost.toFixed(4)}` : null;
+      byProfile.set(key, bucket);
+    }
+    for (const row of item.bySpace || []) {
+      const key = row.key || row.spaceId || row.label || 'unknown';
+      const bucket = bySpace.get(key) || { ...row, calls: 0, totalTokens: 0, totalCost: 0 };
+      bucket.calls += Number(row.calls || 0) || 0;
+      bucket.totalTokens += Number(row.totalTokens || 0) || 0;
+      bucket.totalCost += Number(row.totalCost || 0) || 0;
+      bucket.totalCostText = bucket.totalCost > 0 ? `$${bucket.totalCost.toFixed(4)}` : null;
+      bySpace.set(key, bucket);
+    }
+    for (const row of item.byChannel || []) {
+      const key = row.key || row.label || 'unknown';
+      const bucket = byChannel.get(key) || { ...row, calls: 0, totalTokens: 0, totalCost: 0 };
+      bucket.calls += Number(row.calls || 0) || 0;
+      bucket.totalTokens += Number(row.totalTokens || 0) || 0;
+      bucket.totalCost += Number(row.totalCost || 0) || 0;
+      bucket.totalCostText = bucket.totalCost > 0 ? `$${bucket.totalCost.toFixed(4)}` : null;
+      byChannel.set(key, bucket);
+    }
+    events.push(...(item.events || []));
+  }
+
+  const sortRows = (rows, key = 'totalTokens') => Array.from(rows.values())
+    .sort((a, b) => (Number(b[key] || 0) || 0) - (Number(a[key] || 0) || 0) || String(a.email || a.label || a.key || '').localeCompare(String(b.email || b.label || b.key || '')));
+
+  events.sort((a, b) => (Number(b.ts || 0) || 0) - (Number(a.ts || 0) || 0));
+  return {
+    totalCalls,
+    totalDurationMs,
+    totalDurationText: totalDurationMs > 0 ? formatDurationCompactMs(totalDurationMs) : '—',
+    totalTokens,
+    totalCost,
+    totalCostText: totalCost > 0 ? `$${totalCost.toFixed(4)}` : null,
+    profileCount: byProfile.size,
+    spaceCount: bySpace.size,
+    channelCount: byChannel.size,
+    okCalls: events.filter((event) => event.result === 'ok').length,
+    errorCalls: events.filter((event) => event.result !== 'ok').length,
+    source,
+    byProfile: sortRows(byProfile),
+    bySpace: sortRows(bySpace, 'calls'),
+    byChannel: sortRows(byChannel, 'calls'),
+    events: events.slice(0, 160),
+    ...(keyLabel || {}),
+  };
+}
+
+function readCodexMonthHistory(monthKeyInput) {
+  const monthKey = normalizeHistoryMonthKey(monthKeyInput);
+  const [year, month] = monthKey.split('-').map(Number);
+  const start = new Date(Date.UTC(year, (month || 1) - 1, 1));
+  const next = new Date(Date.UTC(year, month || 1, 1));
+  const daysInMonth = Math.round((next - start) / 86400000);
+  const dayPayloads = [];
+  const dayRows = [];
+  for (let i = 0; i < daysInMonth; i += 1) {
+    const dateKey = shiftHistoryDateKey(monthKey + '-01', i);
+    const item = readCodexCallHistory(dateKey);
+    dayPayloads.push(item);
+    dayRows.push({
+      dateKey,
+      totalCalls: item.totalCalls,
+      totalTokens: item.totalTokens,
+      totalCost: item.totalCost,
+      totalCostText: item.totalCostText,
+    });
+  }
+  return {
+    monthKey,
+    days: dayRows,
+    ...mergeHistoryPayloads(dayPayloads, { monthKey }),
+  };
+}
+
+function readCodexMonthHistoryWindow(monthsInput = 12, endMonthInput) {
+  const months = Math.max(3, Math.min(24, Number(monthsInput || 12) || 12));
+  const endMonthKey = normalizeHistoryMonthKey(endMonthInput);
+  const rows = [];
+  for (let i = months - 1; i >= 0; i -= 1) {
+    const monthKey = shiftHistoryMonthKey(endMonthKey, -i);
+    const item = readCodexMonthHistory(monthKey);
+    rows.push({
+      dateKey: monthKey,
+      totalCalls: item.totalCalls,
+      totalTokens: item.totalTokens,
+      totalCost: item.totalCost,
+      totalCostText: item.totalCostText,
+    });
+  }
+  return {
+    endMonthKey,
+    months: rows,
+    days: rows,
+  };
+}
+
 function readCodexHistoryWindow(daysInput = 14, endDateInput) {
   const days = Math.max(3, Math.min(60, Number(daysInput || 14) || 14));
   const endDateKey = normalizeHistoryDateKey(endDateInput);
@@ -987,8 +1264,16 @@ function normalizePanelState(raw) {
   const hiddenProfiles = Array.isArray(raw?.hiddenProfiles)
     ? [...new Set(raw.hiddenProfiles.filter((id) => typeof id === 'string' && id && id !== 'openai-codex:default'))]
     : [];
+  const loginJob = raw?.loginJob && typeof raw.loginJob === 'object'
+    ? {
+        ...raw.loginJob,
+        startedAt: Number(raw.loginJob.startedAt || 0) || 0,
+        callbackSubmittedAt: Number(raw.loginJob.callbackSubmittedAt || 0) || 0,
+        authMtimeBefore: Number(raw.loginJob.authMtimeBefore || 0) || 0,
+      }
+    : null;
   return {
-    loginJob: raw?.loginJob ?? null,
+    loginJob,
     hiddenProfiles,
   };
 }
@@ -1021,6 +1306,7 @@ function detectLoginRunningFromLog(logText) {
   if (/requires an interactive TTY/i.test(text)) return false;
   if (/❌/i.test(text)) return false;
   if (/✅ 已固化成功/i.test(text)) return false;
+  if (/\[terminal-exit\]/i.test(text)) return false;
   if (/Complete sign-in in browser|Paste the authorization code|已捕获登录链接|已在 Terminal/i.test(text)) return true;
   return false;
 }
@@ -1051,16 +1337,44 @@ function getLoginHint(logText) {
   };
 }
 
+function getAuthProfilesMtime() {
+  try {
+    return Number(fs.statSync(AUTH_STORE).mtimeMs || 0) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 function getLoginJob() {
   const state = readPanelState();
   const job = state.loginJob;
   if (!job) return null;
   const logTail = readLogTail();
-  const running = job.mode === 'terminal'
+  const authMtime = getAuthProfilesMtime();
+  const pidAlive = job.mode === 'terminal' ? isPidRunning(job.pid) : isPidRunning(job.pid);
+  const logSuggestsRunning = job.mode === 'terminal'
     ? detectLoginRunningFromLog(logTail)
-    : isPidRunning(job.pid);
+    : pidAlive;
+  const ageMs = Date.now() - (Number(job.startedAt || 0) || 0);
+  const callbackAgeMs = job.callbackSubmittedAt ? (Date.now() - job.callbackSubmittedAt) : 0;
+  const authChanged = authMtime > (Number(job.authMtimeBefore || 0) || 0);
+  const looksDone = /✅ 已固化成功/i.test(logTail) || (authChanged && callbackAgeMs > 0);
+  const staleTimedOut = Boolean(job.callbackSubmittedAt) && callbackAgeMs > 90 * 1000;
+  const staleDead = !pidAlive && !logSuggestsRunning;
+
+  if (looksDone || staleTimedOut || staleDead) {
+    writePanelState({ ...state, loginJob: null });
+    const hint = looksDone
+      ? { code: 'done', text: '登录已完成，新账号应已写入面板。' }
+      : staleTimedOut
+        ? { code: 'stale-timeout', text: '登录任务已超时收尾，面板已自动清理旧状态；可直接刷新账号列表确认是否已导入。' }
+        : { code: 'stale-dead', text: '登录任务已结束但状态未清，面板已自动修复。' };
+    return { ...job, running: false, hint, recovered: true };
+  }
+
+  const running = pidAlive || logSuggestsRunning;
   const hint = getLoginHint(logTail);
-  return { ...job, running, hint };
+  return { ...job, running, hint, ageMs };
 }
 
 function readLogTail(maxBytes = 12000) {
@@ -1108,6 +1422,8 @@ function startLoginJob(targetEmail = '') {
   const nextJob = {
     pid: child.pid,
     startedAt: Date.now(),
+    callbackSubmittedAt: 0,
+    authMtimeBefore: getAuthProfilesMtime(),
     logPath: LOGIN_LOG_PATH,
     script: LOGIN_SCRIPT,
     mode: 'terminal',
@@ -1146,10 +1462,30 @@ function submitCallbackUrl(callbackUrl) {
     stdio: 'ignore',
     env: process.env,
   });
+  const submittedAt = Date.now();
+  writePanelState({
+    ...state,
+    loginJob: {
+      ...job,
+      callbackSubmittedAt: submittedAt,
+      authMtimeBefore: Number(job.authMtimeBefore || 0) || getAuthProfilesMtime(),
+    },
+  });
+
+  const baseline = Number(job.authMtimeBefore || 0) || getAuthProfilesMtime();
+  setTimeout(() => {
+    const currentState = readPanelState();
+    if (!currentState.loginJob) return;
+    const authMtime = getAuthProfilesMtime();
+    if (authMtime > baseline) {
+      writePanelState({ ...currentState, loginJob: null });
+    }
+  }, 5000);
+
   return {
     submitted: true,
     pid: child.pid,
-    note: '已把回调链接粘贴进 Terminal；几秒后再点刷新看是否新增账号。',
+    note: '已把回调链接粘贴进 Terminal；如果账号库发生更新，面板会自动结束旧任务并刷新。',
   };
 }
 
@@ -1282,34 +1618,66 @@ const HTML = `<!doctype html>
   <title>OpenClaw Codex 账号面板</title>
   <style>
     :root {
-      --bg:#0b1020;--card:#131a2d;--muted:#97a3bf;--text:#eef3ff;--line:#24304d;
-      --accent:#6ea8fe;--good:#43d17c;--warn:#ffcc66;--bad:#ff7a7a;
+      --bg:#0b1020;--bg-top:#0a0f1d;--bg-bottom:#11192b;--card:#131a2d;--card-2:#0f1628;--muted:#97a3bf;--text:#eef3ff;--line:#24304d;
+      --accent:#6ea8fe;--accent-strong:#2e6de6;--good:#43d17c;--warn:#ffcc66;--bad:#ff7a7a;
+      --button-bg:#1d2742;--button-border:#31405f;--button-text:#ffffff;
+      --button-primary-top:#4a8cff;--button-primary-bottom:#2e6de6;--button-primary-border:#2e6de6;
+      --button-warn-bg:#4a3920;--button-warn-border:#7b5d2d;
+      --button-good-bg:#163526;--button-good-border:#2b6d4a;
+      --button-danger-bg:#4a2230;--button-danger-border:#8b4256;
+      --code-bg:#0d1322;--panel-accent-bg:#0b1324;--input-bg:#0a1020;--empty-bg:#0c1425;
+      --usage-bar-bg:#14203a;--table-header-bg:#0f1628;
     }
-    *{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:linear-gradient(180deg,#0a0f1d,#11192b);color:var(--text)}
-    .wrap{max-width:1120px;margin:0 auto;padding:28px 18px 48px}
+    :root[data-theme="light"] {
+      --bg:#f3f6fb;--bg-top:#fafcff;--bg-bottom:#eef3f9;--card:#ffffff;--card-2:#f7f9fc;--muted:#5f6f89;--text:#162033;--line:#d8e1ee;
+      --accent:#3578f6;--accent-strong:#1f63e0;--good:#1f9b59;--warn:#c78400;--bad:#d04b62;
+      --button-bg:#edf2fb;--button-border:#cfd9ea;--button-text:#162033;
+      --button-primary-top:#4a8cff;--button-primary-bottom:#2e6de6;--button-primary-border:#2e6de6;
+      --button-warn-bg:#fff3dc;--button-warn-border:#e5c37a;
+      --button-good-bg:#e6f6ed;--button-good-border:#9bd0ae;
+      --button-danger-bg:#fdecef;--button-danger-border:#ebb0bb;
+      --code-bg:#eef3fa;--panel-accent-bg:#f7f9fc;--input-bg:#ffffff;--empty-bg:#f8fafc;
+      --usage-bar-bg:#e6edf7;--table-header-bg:#f7f9fc;
+    }
+    *{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:linear-gradient(180deg,var(--bg-top),var(--bg-bottom));color:var(--text);transition:background .2s ease,color .2s ease}
+    .wrap{max-width:1360px;margin:0 auto;padding:28px 18px 48px}
     h1{margin:0 0 10px;font-size:30px}.sub{color:var(--muted);margin-bottom:22px}
+    .pageHead{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
+    .themeSwitch{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px}
+    .modeSwitch{display:flex;align-items:center;gap:8px}
+    .modeBtn{min-width:44px;padding:10px 12px;line-height:1;border-radius:12px;display:inline-flex;align-items:center;justify-content:center}
+    .modeBtn svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+    .modeBtn.active{background:linear-gradient(180deg,var(--button-primary-top),var(--button-primary-bottom));border-color:var(--button-primary-border);color:#fff;box-shadow:0 8px 20px rgba(53,120,246,.22)}
     .toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}
-    button{background:#1d2742;color:#fff;border:1px solid #31405f;border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
-    button.primary{background:linear-gradient(180deg,#4a8cff,#2e6de6);border-color:#2e6de6}
-    button.warn{background:#4a3920;border-color:#7b5d2d}
-    button.good{background:#163526;border-color:#2b6d4a}
+    button{background:var(--button-bg);color:var(--button-text);border:1px solid var(--button-border);border-radius:12px;padding:10px 14px;font-size:14px;cursor:pointer}
+    button.primary{background:linear-gradient(180deg,var(--button-primary-top),var(--button-primary-bottom));border-color:var(--button-primary-border);color:#fff}
+    button.warn{background:var(--button-warn-bg);border-color:var(--button-warn-border)}
+    button.good{background:var(--button-good-bg);border-color:var(--button-good-border)}
     button:disabled{opacity:.5;cursor:not-allowed}
-    .grid{display:grid;grid-template-columns:2fr 1fr;gap:16px}
-    .card{background:rgba(19,26,45,.92);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
-    .cards{display:grid;gap:14px}
-    .profile{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628}
+    .grid{display:block}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.12)}
+    .cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+    .loginModal{position:fixed;inset:0;background:rgba(8,12,20,.48);display:none;align-items:center;justify-content:center;padding:24px;z-index:50}
+    .loginModal.show{display:flex}
+    .loginModalCard{width:min(780px,100%);max-height:min(88vh,920px);overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:0 24px 60px rgba(0,0,0,.28)}
+    .loginModalHead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+    .collapseCard{margin-top:16px}
+    .collapseCard summary{list-style:none;cursor:pointer;font-size:16px;font-weight:700;display:flex;align-items:center;justify-content:space-between;color:var(--text)}
+    .collapseCard summary::-webkit-details-marker{display:none}
+    .collapseBody{margin-top:12px}
+    .profile{border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--card-2)}
     .row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
     .title{font-size:18px;font-weight:700}.muted{color:var(--muted)}
-    .tags{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.tag{font-size:12px;padding:4px 8px;border-radius:999px;background:#1b2440;border:1px solid #32405e;color:#dbe7ff}
-    .tag.good{background:#12311f;border-color:#23643f;color:#98efbd}.tag.warn{background:#3c2f16;border-color:#8c6a1c;color:#ffd67d}.tag.bad{background:#3d1f25;border-color:#804350;color:#ff9ca9}
-    code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:#0d1322;padding:2px 6px;border-radius:8px;border:1px solid #24304d}
-    pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.5;background:#0a1020;border:1px solid var(--line);border-radius:14px;padding:12px;min-height:220px;max-height:420px;overflow:auto}
+    .tags{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.tag{font-size:12px;padding:4px 8px;border-radius:999px;background:color-mix(in srgb, var(--accent) 12%, var(--card-2));border:1px solid color-mix(in srgb, var(--line) 85%, var(--accent) 15%);color:var(--text)}
+    .tag.good{background:color-mix(in srgb, var(--good) 18%, var(--card-2));border-color:color-mix(in srgb, var(--good) 45%, var(--line) 55%);color:var(--text)}.tag.warn{background:color-mix(in srgb, var(--warn) 18%, var(--card-2));border-color:color-mix(in srgb, var(--warn) 45%, var(--line) 55%);color:var(--text)}.tag.bad{background:color-mix(in srgb, var(--bad) 18%, var(--card-2));border-color:color-mix(in srgb, var(--bad) 45%, var(--line) 55%);color:var(--text)}
+    code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:var(--code-bg);padding:2px 6px;border-radius:8px;border:1px solid var(--line)}
+    pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.5;background:var(--input-bg);border:1px solid var(--line);border-radius:14px;padding:12px;min-height:220px;max-height:420px;overflow:auto}
     .status{font-size:14px;margin-bottom:10px}.ok{color:var(--good)}.warnText{color:var(--warn)}.badText{color:var(--bad)}
     .list{display:flex;flex-direction:column;gap:10px}.kv{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #2a3755}.kv:last-child{border-bottom:none}
-    .callbackBox{margin-top:12px;padding:12px;border:1px dashed #3a4a70;border-radius:14px;background:#0d1425}
-    .callbackBox textarea{width:100%;min-height:96px;border-radius:12px;border:1px solid #31405f;background:#0a1020;color:#eef3ff;padding:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical}
+    .callbackBox{margin-top:12px;padding:12px;border:1px dashed var(--button-border);border-radius:14px;background:var(--panel-accent-bg)}
+    .callbackBox textarea{width:100%;min-height:96px;border-radius:12px;border:1px solid var(--button-border);background:var(--input-bg);color:var(--text);padding:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical}
     .callbackHint{font-size:13px;color:var(--muted);margin-bottom:8px}
-    .usageBox{margin-top:12px;padding:12px;border:1px solid #24304d;border-radius:14px;background:#0b1324}
+    .usageBox{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--panel-accent-bg)}
     .usageHead{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}
     .usageTitle{font-size:14px;font-weight:700}
     .usageMeta{font-size:12px;color:var(--muted)}
@@ -1317,76 +1685,100 @@ const HTML = `<!doctype html>
     .usageRows{display:flex;flex-direction:column;gap:10px;margin-top:10px}
     .usageRow{display:flex;flex-direction:column;gap:6px}
     .usageRowTop{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}
-    .usageBar{height:10px;border-radius:999px;background:#14203a;border:1px solid #24304d;overflow:hidden}
+    .usageBar{height:10px;border-radius:999px;background:var(--usage-bar-bg);border:1px solid var(--line);overflow:hidden}
     .usageFill{height:100%;border-radius:999px;background:linear-gradient(90deg,#3f82ff,#6ea8fe)}
     .usageFill.warn{background:linear-gradient(90deg,#c08a22,#ffcc66)}
     .usageFill.bad{background:linear-gradient(90deg,#b94c5a,#ff7a7a)}
     .usageFoot{font-size:12px;color:var(--muted)}
-    input[type="date"]{background:#0f1628;color:#eef3ff;border:1px solid #31405f;border-radius:12px;padding:10px 12px;font-size:14px}
+    input[type="date"]{background:var(--input-bg);color:var(--text);border:1px solid var(--button-border);border-radius:12px;padding:10px 12px;font-size:14px}
     .historyGrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-    .historyItem{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628}
+    .historyItem{border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--card-2)}
     .historyItemTitle{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
     .historyMeta{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
-    .historyEmpty{padding:16px;border:1px dashed #32405e;border-radius:14px;color:var(--muted);background:#0c1425}
+    .historyEmpty{padding:16px;border:1px dashed var(--button-border);border-radius:14px;color:var(--muted);background:var(--empty-bg)}
     .statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:4px 0 16px}
-    .statCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628}
+    .statCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--card-2)}
     .statLabel{font-size:12px;color:var(--muted);margin-bottom:8px}.statValue{font-size:24px;font-weight:800}
     .historyVizGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}
-    .vizCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628}
+    .vizCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--card-2)}
     .donutWrap{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
     .donut{width:132px;height:132px;border-radius:50%;position:relative;flex:0 0 auto}
-    .donut::after{content:'';position:absolute;inset:22px;border-radius:50%;background:#0f1628;border:1px solid #24304d}
+    .donut::after{content:'';position:absolute;inset:22px;border-radius:50%;background:var(--card-2);border:1px solid var(--line)}
     .legend{display:flex;flex-direction:column;gap:8px;min-width:220px;flex:1}
     .legendRow{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted)}
     .legendLeft{display:flex;align-items:center;gap:8px;min-width:0}.swatch{width:10px;height:10px;border-radius:999px;flex:0 0 auto}
-    .trendCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628;margin-bottom:16px}
+    .trendCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--card-2);margin-bottom:16px}
     .trendBars{display:flex;align-items:flex-end;gap:8px;height:150px;margin-top:12px;overflow-x:auto;padding-bottom:8px}
     .trendBarCol{display:flex;flex-direction:column;align-items:center;gap:8px;min-width:36px}
     .trendBar{width:100%;min-height:6px;border-radius:10px;background:linear-gradient(180deg,#6ea8fe,#2e6de6)}
     .trendLabel{font-size:11px;color:var(--muted)}
-    .pivotCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628;margin-bottom:16px}
+    .pivotCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--card-2);margin-bottom:16px}
     .pivotTableWrap{overflow:auto}
     table.pivotTable{width:100%;border-collapse:collapse;font-size:13px}
-    .pivotTable th,.pivotTable td{padding:10px 12px;border-bottom:1px solid #22304d;text-align:left;white-space:nowrap}
-    .pivotTable th{color:var(--muted);font-weight:600;position:sticky;top:0;background:#0f1628}
+    .pivotTable th,.pivotTable td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+    .pivotTable th{color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--table-header-bg)}
     .segBtns{display:flex;gap:8px;flex-wrap:wrap}
-    .segBtns button.active{background:linear-gradient(180deg,#4a8cff,#2e6de6);border-color:#2e6de6}
-    button.danger{background:#4a2230;border-color:#8b4256}
-    @media (max-width: 900px){.grid,.historyGrid,.historyVizGrid,.statsGrid{grid-template-columns:1fr}}
+    .segBtns button.active{background:linear-gradient(180deg,var(--button-primary-top),var(--button-primary-bottom));border-color:var(--button-primary-border);color:#fff}
+    button.danger{background:var(--button-danger-bg);border-color:var(--button-danger-border)}
+    @media (max-width: 900px){.grid,.historyGrid,.historyVizGrid,.statsGrid,.cards{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>OpenClaw Codex 账号面板</h1>
-    <div class="sub">看当前 Codex 账号、轮换顺序、最近实际可用账号，并把每个账号的 5h / 1周额度直接显示出来。</div>
+    <div class="pageHead">
+      <div>
+        <h1>OpenClaw 账号面板</h1>
+        <div class="sub">看账号、额度和当前实际可用状态。</div>
+      </div>
+      <div class="themeSwitch">
+        <span>主题</span>
+        <div class="modeSwitch" role="tablist" aria-label="主题模式">
+          <button type="button" class="modeBtn" id="themeSystemBtn" data-theme-mode="system" title="跟随系统"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="11" rx="2"></rect><path d="M9 19h6"></path><path d="M12 16v3"></path></svg></button>
+          <button type="button" class="modeBtn" id="themeLightBtn" data-theme-mode="light" title="浅色模式"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"></circle><path d="M12 2.5v3"></path><path d="M12 18.5v3"></path><path d="M2.5 12h3"></path><path d="M18.5 12h3"></path><path d="M5.6 5.6l2.1 2.1"></path><path d="M16.3 16.3l2.1 2.1"></path><path d="M18.4 5.6l-2.1 2.1"></path><path d="M7.7 16.3l-2.1 2.1"></path></svg></button>
+          <button type="button" class="modeBtn" id="themeDarkBtn" data-theme-mode="dark" title="深色模式"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 3.2a8.8 8.8 0 1 0 6.3 15.1A9.5 9.5 0 0 1 14.5 3.2Z"></path></svg></button>
+        </div>
+      </div>
+    </div>
 
     <div class="toolbar">
       <button class="primary" id="loginBtn">一键登录新账号</button>
       <button id="refreshBtn">刷新状态</button>
       <button class="good" id="quotaRefreshBtn">刷新额度</button>
-      <button class="warn" id="stopBtn">停止当前登录任务</button>
     </div>
 
     <div class="grid">
       <div class="card">
         <div class="row" style="margin-bottom:12px">
           <div>
-            <div class="title">Codex 账号列表</div>
+            <div class="title">账号列表</div>
             <div class="muted">独立 profile 会参与轮换；default 是当前登录槽位。面板打开时会自动拉一次额度，之后只在你点“刷新额度”时更新。</div>
           </div>
           <div id="summary" class="muted">加载中…</div>
         </div>
         <div id="groupSummary" class="muted" style="margin-bottom:12px">加载分组中…</div>
         <div id="profiles" class="cards"></div>
-        <div style="margin-top:18px">
-          <div class="title" style="font-size:18px;margin-bottom:8px">已隐藏账号</div>
-          <div class="muted" style="margin-bottom:12px">这里是已移出轮换的账号，可恢复或彻底删除。</div>
-          <div id="hiddenProfiles" class="cards"></div>
-        </div>
+        <details class="collapseCard">
+          <summary>已隐藏账号</summary>
+          <div class="collapseBody">
+            <div class="muted" style="margin-bottom:12px">这里是已移出轮换的账号，可恢复或彻底删除。</div>
+            <div id="hiddenProfiles" class="cards"></div>
+          </div>
+        </details>
       </div>
+    </div>
 
-      <div class="card">
-        <div class="title" style="margin-bottom:10px">登录任务</div>
+    <div id="loginModal" class="loginModal" aria-hidden="true">
+      <div class="loginModalCard">
+        <div class="loginModalHead">
+          <div>
+            <div class="title" style="font-size:20px">登录新账号</div>
+            <div class="muted">这里集中显示登录任务、日志和回调补录。</div>
+          </div>
+          <button id="loginModalClose">关闭</button>
+        </div>
+        <div class="toolbar" style="margin-bottom:12px">
+          <button class="warn" id="stopBtn">停止当前登录任务</button>
+        </div>
         <div id="jobStatus" class="status muted">读取中…</div>
         <pre id="jobLog"></pre>
         <div class="callbackBox">
@@ -1399,19 +1791,26 @@ const HTML = `<!doctype html>
       </div>
     </div>
 
-    <div class="card" style="margin-top:16px">
-      <div class="row" style="margin-bottom:12px">
+    <details class="card collapseCard">
+      <summary>调用分析</summary>
+      <div class="collapseBody">
+        <div class="row" style="margin-bottom:12px">
         <div>
           <div class="title">每日调用记录</div>
-          <div class="muted">按天看 Codex 实际命中的账号、调用次数、总时长，以及最近一次调用明细。</div>
+          <div class="muted">按天查看账号命中、调用次数和最近明细。</div>
         </div>
         <div id="historySummary" class="muted">读取中…</div>
       </div>
       <div class="toolbar" style="margin-bottom:12px">
+        <div class="segBtns">
+          <button id="billModeDayBtn" class="active">日账单</button>
+          <button id="billModeMonthBtn">月账单</button>
+        </div>
         <button id="historyPrevBtn">前一天</button>
         <button id="historyTodayBtn">今天</button>
         <button id="historyNextBtn">后一天</button>
         <input id="historyDateInput" type="date" />
+        <input id="historyMonthInput" type="month" style="display:none" />
         <button id="historyRefreshBtn">刷新调用记录</button>
       </div>
       <div id="historyOverview" class="statsGrid"></div>
@@ -1459,12 +1858,19 @@ const HTML = `<!doctype html>
           <div id="historyProfiles" class="cards"></div>
         </div>
         <div>
-          <div class="usageTitle" style="margin-bottom:10px">最近调用明细</div>
+          <div class="row" style="margin-bottom:10px">
+            <div class="usageTitle">最近调用明细</div>
+            <div class="segBtns">
+              <button id="historyEventsPrevBtn">上一页</button>
+              <span id="historyEventsPageInfo" class="muted">1 / 1</span>
+              <button id="historyEventsNextBtn">下一页</button>
+            </div>
+          </div>
           <div id="historyEvents" class="cards"></div>
         </div>
       </div>
     </div>
-  </div>
+  </details>
 
   <script>
     const profilesEl = document.getElementById('profiles');
@@ -1480,6 +1886,8 @@ const HTML = `<!doctype html>
     const quotaRefreshBtn = document.getElementById('quotaRefreshBtn');
     const stopBtn = document.getElementById('stopBtn');
     const hiddenProfilesEl = document.getElementById('hiddenProfiles');
+    const loginModalEl = document.getElementById('loginModal');
+    const loginModalCloseEl = document.getElementById('loginModalClose');
     const historySummaryEl = document.getElementById('historySummary');
     const historyProfilesEl = document.getElementById('historyProfiles');
     const historyEventsEl = document.getElementById('historyEvents');
@@ -1487,7 +1895,10 @@ const HTML = `<!doctype html>
     const historyTodayBtn = document.getElementById('historyTodayBtn');
     const historyNextBtn = document.getElementById('historyNextBtn');
     const historyDateInputEl = document.getElementById('historyDateInput');
+    const historyMonthInputEl = document.getElementById('historyMonthInput');
     const historyRefreshBtn = document.getElementById('historyRefreshBtn');
+    const billModeDayBtn = document.getElementById('billModeDayBtn');
+    const billModeMonthBtn = document.getElementById('billModeMonthBtn');
     const historyOverviewEl = document.getElementById('historyOverview');
     const historyTrendEl = document.getElementById('historyTrend');
     const historyActiveDatesEl = document.getElementById('historyActiveDates');
@@ -1498,8 +1909,18 @@ const HTML = `<!doctype html>
     const pivotProfilesBtn = document.getElementById('pivotProfilesBtn');
     const pivotSpacesBtn = document.getElementById('pivotSpacesBtn');
     const pivotChannelsBtn = document.getElementById('pivotChannelsBtn');
+    const themeButtons = Array.from(document.querySelectorAll('[data-theme-mode]'));
+    const historyEventsPrevBtn = document.getElementById('historyEventsPrevBtn');
+    const historyEventsNextBtn = document.getElementById('historyEventsNextBtn');
+    const historyEventsPageInfoEl = document.getElementById('historyEventsPageInfo');
     let currentHistoryDateKey = todayDateKey();
+    let currentHistoryMonthKey = todayDateKey().slice(0,7);
+    let currentHistoryMode = 'day';
     let currentPivotDimension = 'profile';
+    let currentThemeMode = 'system';
+    let currentHistoryEvents = [];
+    let currentHistoryEventsPage = 1;
+    const HISTORY_EVENTS_PAGE_SIZE = 6;
 
     async function api(url, options = {}) {
       const res = await fetch(url, {
@@ -1533,6 +1954,81 @@ const HTML = `<!doctype html>
       }).formatToParts(new Date());
       const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
       return lookup.year + '-' + lookup.month + '-' + lookup.day;
+    }
+
+    function resolveActualTheme(themeMode) {
+      if (themeMode === 'light' || themeMode === 'dark') return themeMode;
+      return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    }
+
+    function applyTheme(themeMode) {
+      currentThemeMode = ['system', 'light', 'dark'].includes(themeMode) ? themeMode : 'system';
+      document.documentElement.dataset.theme = resolveActualTheme(currentThemeMode);
+      themeButtons.forEach((btn) => btn.classList.toggle('active', btn.dataset.themeMode === currentThemeMode));
+    }
+
+    async function loadPreferences() {
+      const prefs = await api('/api/preferences');
+      applyTheme((prefs && prefs.themeMode) || 'system');
+      return prefs;
+    }
+
+    async function saveTheme(themeMode) {
+      const data = await api('/api/preferences/theme', {
+        method: 'POST',
+        body: JSON.stringify({ themeMode }),
+      });
+      applyTheme((data && data.themeMode) || themeMode);
+    }
+
+    const mediaTheme = window.matchMedia('(prefers-color-scheme: light)');
+    mediaTheme.addEventListener('change', () => {
+      if (currentThemeMode === 'system') applyTheme('system');
+    });
+
+    function openLoginModal() {
+      if (!loginModalEl) return;
+      loginModalEl.classList.add('show');
+      loginModalEl.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeLoginModal() {
+      if (!loginModalEl) return;
+      loginModalEl.classList.remove('show');
+      loginModalEl.setAttribute('aria-hidden', 'true');
+    }
+
+
+    function shiftMonthKey(monthKey, deltaMonths) {
+      const [year, month] = String(monthKey || todayDateKey().slice(0,7)).split('-').map(Number);
+      const dt = new Date(Date.UTC(year, (month || 1) - 1, 1));
+      dt.setUTCMonth(dt.getUTCMonth() + deltaMonths);
+      return dt.toISOString().slice(0, 7);
+    }
+
+    function applyHistoryMode(mode) {
+      currentHistoryMode = mode === 'month' ? 'month' : 'day';
+      billModeDayBtn.classList.toggle('active', currentHistoryMode === 'day');
+      billModeMonthBtn.classList.toggle('active', currentHistoryMode === 'month');
+      historyDateInputEl.style.display = currentHistoryMode === 'day' ? '' : 'none';
+      historyMonthInputEl.style.display = currentHistoryMode === 'month' ? '' : 'none';
+      historyPrevBtn.textContent = currentHistoryMode === 'day' ? '前一天' : '前一月';
+      historyTodayBtn.textContent = currentHistoryMode === 'day' ? '今天' : '本月';
+      historyNextBtn.textContent = currentHistoryMode === 'day' ? '后一天' : '后一月';
+    }
+
+    function renderHistoryEventsPage() {
+      const events = currentHistoryEvents || [];
+      const totalPages = Math.max(1, Math.ceil(events.length / HISTORY_EVENTS_PAGE_SIZE));
+      currentHistoryEventsPage = Math.min(totalPages, Math.max(1, currentHistoryEventsPage));
+      const start = (currentHistoryEventsPage - 1) * HISTORY_EVENTS_PAGE_SIZE;
+      const pageItems = events.slice(start, start + HISTORY_EVENTS_PAGE_SIZE);
+      historyEventsEl.innerHTML = pageItems.length
+        ? pageItems.map(historyEventCard).join('')
+        : '<div class="historyEmpty">这一天还没有明细。</div>';
+      if (historyEventsPageInfoEl) historyEventsPageInfoEl.textContent = currentHistoryEventsPage + ' / ' + totalPages;
+      if (historyEventsPrevBtn) historyEventsPrevBtn.disabled = currentHistoryEventsPage <= 1;
+      if (historyEventsNextBtn) historyEventsNextBtn.disabled = currentHistoryEventsPage >= totalPages;
     }
 
     function shiftDateKey(dateKey, deltaDays) {
@@ -1661,10 +2157,12 @@ const HTML = `<!doctype html>
         typeof usageSummary.errorCount === 'number' && usageSummary.errorCount > 0 ? ('失败 ' + usageSummary.errorCount) : null,
       ].filter(Boolean).join(' · ');
       summaryEl.textContent = '共 ' + state.profiles.length + ' 个 Codex 条目，实际空间 ' + ((state.groups || []).length) + ' 个，独立轮换 ' + state.profiles.filter((p) => p.isIndependent).length + ' 个 · ' + usageText;
-      groupSummaryEl.textContent = (state.groups || []).map((group) => {
-        const emails = (group.members || []).map((m) => m.email || m.profileId).join(' / ');
-        return group.label + '（' + group.memberCount + ' 个）：' + emails;
-      }).join('   ｜   ') || '暂无分组信息';
+      groupSummaryEl.innerHTML = (state.groups || []).length
+        ? (state.groups || []).map((group) => {
+            const emails = (group.members || []).map((m) => escapeHtml(m.email || m.profileId)).join(' / ');
+            return '<div class="historyMeta" style="margin:0 0 6px"><strong>' + escapeHtml(group.label) + '</strong>（' + group.memberCount + ' 个）：' + emails + '</div>';
+          }).join('')
+        : '暂无分组信息';
       profilesEl.innerHTML = state.profiles.length
         ? state.profiles.map((profile) => profileCard(profile, { hidden: false })).join('')
         : '<div class="historyEmpty">当前没有可见 Codex 账号。</div>';
@@ -1944,28 +2442,40 @@ const HTML = `<!doctype html>
         '</div>';
     }
 
-    async function loadHistory(dateKey = currentHistoryDateKey) {
-      currentHistoryDateKey = dateKey || todayDateKey();
-      historyDateInputEl.value = currentHistoryDateKey;
-      const [data, windowData] = await Promise.all([
-        api('/api/call-history?date=' + encodeURIComponent(currentHistoryDateKey)),
-        api('/api/call-history-window?days=14&endDate=' + encodeURIComponent(currentHistoryDateKey)),
-      ]);
+    async function loadHistory(value = currentHistoryDateKey, mode = currentHistoryMode) {
+      currentHistoryMode = mode === 'month' ? 'month' : 'day';
+      applyHistoryMode(currentHistoryMode);
+      if (currentHistoryMode === 'month') {
+        currentHistoryMonthKey = /^\d{4}-\d{2}$/.test(String(value || '')) ? String(value) : currentHistoryMonthKey;
+        historyMonthInputEl.value = currentHistoryMonthKey;
+      } else {
+        currentHistoryDateKey = value || todayDateKey();
+        historyDateInputEl.value = currentHistoryDateKey;
+      }
+      const [data, windowData] = await Promise.all(currentHistoryMode === 'month'
+        ? [
+            api('/api/call-history-month?month=' + encodeURIComponent(currentHistoryMonthKey)),
+            api('/api/call-history-month-window?months=12&endMonth=' + encodeURIComponent(currentHistoryMonthKey)),
+          ]
+        : [
+            api('/api/call-history?date=' + encodeURIComponent(currentHistoryDateKey)),
+            api('/api/call-history-window?days=14&endDate=' + encodeURIComponent(currentHistoryDateKey)),
+          ]);
       const sourceText = data.source === 'session-transcript' ? '来源：真实 session 记录（含历史归档）' : '来源：usage 日志';
-      historySummaryEl.textContent = data.dateKey + ' · 调用 ' + data.totalCalls + ' 次 · tokens ' + formatMetricNumber(data.totalTokens || 0) + (data.totalCostText ? (' · 成本 ' + data.totalCostText) : '') + ' · 账号 ' + data.profileCount + ' 个 · ' + sourceText;
+      historySummaryEl.textContent = (currentHistoryMode === 'month' ? data.monthKey : data.dateKey) + ' · 调用 ' + data.totalCalls + ' 次 · tokens ' + formatMetricNumber(data.totalTokens || 0) + (data.totalCostText ? (' · 成本 ' + data.totalCostText) : '') + ' · 账号 ' + data.profileCount + ' 个 · ' + sourceText;
       renderHistoryOverview(data);
       renderHistoryTrend(windowData);
-      renderDonutChart(historySpaceChartEl, data.bySpace, '这一天还没有空间分布数据。');
-      renderDonutChart(historyChannelChartEl, data.byChannel, '这一天还没有渠道分布数据。');
-      renderDonutChart(historyProfileChartEl, data.byProfile, '这一天还没有账号分布数据。');
+      renderDonutChart(historySpaceChartEl, data.bySpace, currentHistoryMode === 'month' ? '这个月还没有空间分布数据。' : '这一天还没有空间分布数据。');
+      renderDonutChart(historyChannelChartEl, data.byChannel, currentHistoryMode === 'month' ? '这个月还没有渠道分布数据。' : '这一天还没有渠道分布数据。');
+      renderDonutChart(historyProfileChartEl, data.byProfile, currentHistoryMode === 'month' ? '这个月还没有账号分布数据。' : '这一天还没有账号分布数据。');
       renderPivotButtons();
       renderPivotTable(data);
       historyProfilesEl.innerHTML = (data.byProfile || []).length
         ? data.byProfile.map(historyProfileCard).join('')
-        : '<div class="historyEmpty">这一天还没有记录到 Codex 实际调用。</div>';
-      historyEventsEl.innerHTML = (data.events || []).length
-        ? data.events.map(historyEventCard).join('')
-        : '<div class="historyEmpty">这一天还没有明细。</div>';
+        : '<div class="historyEmpty">' + (currentHistoryMode === 'month' ? '这个月还没有记录到实际调用。' : '这一天还没有记录到实际调用。') + '</div>';
+      currentHistoryEvents = data.events || [];
+      currentHistoryEventsPage = 1;
+      renderHistoryEventsPage();
     }
 
     function renderJob(job) {
@@ -1987,12 +2497,18 @@ const HTML = `<!doctype html>
         : '如果浏览器已经登录成功，但面板刷新还看不到新账号，就把 localhost 回调链接粘到这里。';
     }
 
+    loginModalCloseEl.addEventListener('click', closeLoginModal);
+    loginModalEl.addEventListener('click', (event) => {
+      if (event.target === loginModalEl) closeLoginModal();
+    });
+
     loginBtn.addEventListener('click', async () => {
+      openLoginModal();
       loginBtn.disabled = true;
       try {
         const data = await api('/api/login/start', { method: 'POST' });
         if (data.alreadyRunning) {
-          alert('已经有一个登录任务在跑，先看右侧日志。');
+          alert('已经有一个登录任务在跑，直接看这个登录窗口。');
         }
         await loadState();
       } catch (err) {
@@ -2004,35 +2520,47 @@ const HTML = `<!doctype html>
 
     refreshBtn.addEventListener('click', async () => {
       await loadState();
-      await loadHistory(currentHistoryDateKey);
+      await loadHistory(currentHistoryMode === 'month' ? currentHistoryMonthKey : currentHistoryDateKey, currentHistoryMode);
     });
     quotaRefreshBtn.addEventListener('click', refreshUsage);
     historyRefreshBtn.addEventListener('click', async () => {
-      await loadHistory(currentHistoryDateKey);
+      await loadHistory(currentHistoryMode === 'month' ? currentHistoryMonthKey : currentHistoryDateKey, currentHistoryMode);
     });
     historyPrevBtn.addEventListener('click', async () => {
-      await loadHistory(shiftDateKey(currentHistoryDateKey, -1));
+      await loadHistory(currentHistoryMode === 'month' ? shiftMonthKey(currentHistoryMonthKey, -1) : shiftDateKey(currentHistoryDateKey, -1), currentHistoryMode);
     });
     historyTodayBtn.addEventListener('click', async () => {
-      await loadHistory(todayDateKey());
+      await loadHistory(currentHistoryMode === 'month' ? todayDateKey().slice(0,7) : todayDateKey(), currentHistoryMode);
     });
     historyNextBtn.addEventListener('click', async () => {
-      await loadHistory(shiftDateKey(currentHistoryDateKey, 1));
+      await loadHistory(currentHistoryMode === 'month' ? shiftMonthKey(currentHistoryMonthKey, 1) : shiftDateKey(currentHistoryDateKey, 1), currentHistoryMode);
     });
     historyDateInputEl.addEventListener('change', async () => {
-      await loadHistory(historyDateInputEl.value || todayDateKey());
+      await loadHistory(historyDateInputEl.value || todayDateKey(), 'day');
+    });
+    historyMonthInputEl.addEventListener('change', async () => {
+      await loadHistory(historyMonthInputEl.value || todayDateKey().slice(0,7), 'month');
+    });
+    billModeDayBtn.addEventListener('click', async () => {
+      await loadHistory(currentHistoryDateKey, 'day');
+    });
+    billModeMonthBtn.addEventListener('click', async () => {
+      await loadHistory(currentHistoryMonthKey, 'month');
     });
     pivotProfilesBtn.addEventListener('click', async () => {
       currentPivotDimension = 'profile';
-      await loadHistory(currentHistoryDateKey);
+      applyHistoryMode('day');
+      await loadHistory(currentHistoryDateKey, currentHistoryMode);
     });
     pivotSpacesBtn.addEventListener('click', async () => {
       currentPivotDimension = 'space';
-      await loadHistory(currentHistoryDateKey);
+      applyHistoryMode('day');
+      await loadHistory(currentHistoryDateKey, currentHistoryMode);
     });
     pivotChannelsBtn.addEventListener('click', async () => {
       currentPivotDimension = 'channel';
-      await loadHistory(currentHistoryDateKey);
+      applyHistoryMode('day');
+      await loadHistory(currentHistoryDateKey, currentHistoryMode);
     });
     submitCallbackBtn.addEventListener('click', async () => {
       const callbackUrl = (callbackInputEl.value || '').trim();
@@ -2064,16 +2592,42 @@ const HTML = `<!doctype html>
       }
     });
 
+    themeButtons.forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const mode = btn.dataset.themeMode;
+        themeButtons.forEach((item) => item.disabled = true);
+        try {
+          await saveTheme(mode);
+        } catch (err) {
+          alert(err.message);
+          applyTheme(currentThemeMode);
+        } finally {
+          themeButtons.forEach((item) => item.disabled = false);
+        }
+      });
+    });
+    historyEventsPrevBtn.addEventListener('click', async () => {
+      currentHistoryEventsPage -= 1;
+      renderHistoryEventsPage();
+    });
+    historyEventsNextBtn.addEventListener('click', async () => {
+      currentHistoryEventsPage += 1;
+      renderHistoryEventsPage();
+    });
+
     async function init() {
+      await loadPreferences();
       await loadState();
       await refreshUsage();
-      await loadHistory(currentHistoryDateKey);
+      applyHistoryMode('day');
+      await loadHistory(currentHistoryDateKey, currentHistoryMode);
     }
 
     init();
     setInterval(async () => {
       await loadState();
-      await loadHistory(currentHistoryDateKey);
+      applyHistoryMode('day');
+      await loadHistory(currentHistoryDateKey, currentHistoryMode);
     }, 5000);
   </script>
 </body>
@@ -2087,6 +2641,22 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       return json(res, 200, buildProfiles());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/preferences') {
+      const preferences = readPanelPreferences();
+      return json(res, 200, {
+        ...preferences,
+        launchShape: deriveLaunchShape(preferences.launchMode),
+      });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/menubar-summary') {
+      return json(res, 200, buildMenubarSummary());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/call-history-month') {
+      return json(res, 200, readCodexMonthHistory(url.searchParams.get('month')));
+    }
+    if (req.method === 'GET' && url.pathname === '/api/call-history-month-window') {
+      return json(res, 200, readCodexMonthHistoryWindow(url.searchParams.get('months'), url.searchParams.get('endMonth')));
     }
     if (req.method === 'GET' && url.pathname === '/api/login-job') {
       return json(res, 200, { job: getLoginJob(), logTail: readLogTail() });
@@ -2102,6 +2672,36 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       if (!body.callbackUrl) return json(res, 400, { error: '缺少 callbackUrl' });
       return json(res, 200, submitCallbackUrl(body.callbackUrl));
+    }
+    if (req.method === 'POST' && url.pathname === '/api/preferences/theme') {
+      const body = await readJsonBody(req);
+      if (!['system', 'light', 'dark'].includes(body.themeMode)) {
+        return json(res, 400, { error: 'themeMode 只支持 system / light / dark' });
+      }
+      const next = {
+        ...readPanelPreferences(),
+        themeMode: body.themeMode,
+      };
+      writePanelPreferences(next);
+      return json(res, 200, {
+        ...readPanelPreferences(),
+        launchShape: deriveLaunchShape(readPanelPreferences().launchMode),
+      });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/preferences/launch-mode') {
+      const body = await readJsonBody(req);
+      if (!['window-only', 'menubar-only', 'window-and-menubar'].includes(body.launchMode)) {
+        return json(res, 400, { error: 'launchMode 只支持 window-only / menubar-only / window-and-menubar' });
+      }
+      const next = {
+        ...readPanelPreferences(),
+        launchMode: body.launchMode,
+      };
+      writePanelPreferences(next);
+      return json(res, 200, {
+        ...readPanelPreferences(),
+        launchShape: deriveLaunchShape(readPanelPreferences().launchMode),
+      });
     }
     if (req.method === 'POST' && url.pathname === '/api/order/promote') {
       const body = await readJsonBody(req);
