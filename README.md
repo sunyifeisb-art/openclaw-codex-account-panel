@@ -1,8 +1,8 @@
 # OpenClaw Panel
 
-一个给 OpenClaw / Codex OAuth 多账号轮换场景用的本地面板与桌面 App（原名 OpenClaw Codex Account Panel）。
+OpenClaw / Codex OAuth 多账号管理面板与 macOS 桌面 App，支持账号轮换、额度查看、真实空间分组、调用历史分析与安全删除。
 
-它现在已经不是一个只看账号列表的小工具，而是一个完整的本地运维面板，覆盖：
+核心能力包括：
 
 - Codex 多账号列表与轮换顺序
 - 账号额度查看（5h / 1周）
@@ -13,7 +13,7 @@
 
 ## 当前版本亮点
 
-> 最新发布：`v0.1.4`（OpenClaw Panel 命名收敛、tray-first 壳层、登录状态自动收尾修复）
+> 最新发布：`v0.1.4`，支持菜单栏常驻、日/月账单、三态主题，以及登录状态自动清理与刷新。
 
 ### 1. 账号管理
 
