@@ -58,7 +58,13 @@
 
 ## 面板预览
 
+### 账号与额度主面板
+
 ![OpenClaw Codex Panel preview](./docs/panel-preview-redacted-v3.png)
+
+### 调用分析仪表盘（2026-03-24 更新）
+
+![OpenClaw Codex Panel analytics preview](./docs/panel-preview-analytics-20260324.png)
 
 ## 目录结构
 
