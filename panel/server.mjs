@@ -6,12 +6,13 @@ import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 
 const PORT = Number(process.env.CODEX_PANEL_PORT || 7071);
-const WORKSPACE = process.env.OPENCLAW_WORKSPACE || path.join(os.homedir(), '.openclaw', 'workspace');
-const PANEL_HOME = process.env.OPENCLAW_CODEX_PANEL_HOME || WORKSPACE;
-const DATA_DIR = path.join(PANEL_HOME, 'data');
+const WORKSPACE = process.env.OPENCLAW_WORKSPACE || '/Users/xiangyang/.openclaw/workspace';
+const DATA_DIR = path.join(WORKSPACE, 'data');
+const OPENCLAW_HOME = path.join(os.homedir(), '.openclaw');
+const AGENTS_ROOT = path.join(OPENCLAW_HOME, 'agents');
 const AUTH_PATH = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
 const CALL_LOG_PATH = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'agent', 'codex-profile-usage.jsonl');
-const LOGIN_SCRIPT = process.env.OPENCLAW_CODEX_LOGIN_SCRIPT || path.join(WORKSPACE, 'scripts', 'openclaw_codex_add_profile.mjs');
+const LOGIN_SCRIPT = path.join(WORKSPACE, 'scripts', 'openclaw_codex_add_profile.mjs');
 const PANEL_STATE_PATH = path.join(DATA_DIR, 'codex-panel-state.json');
 const LOGIN_LOG_PATH = path.join(DATA_DIR, 'codex-panel-login.log');
 const LOGIN_TRIGGER_PATH = path.join(DATA_DIR, 'codex-panel-last-launch.txt');
@@ -320,6 +321,19 @@ function getExp(profile) {
   return Number(payload?.exp || 0) || null;
 }
 
+function getProfileSpace(profile, profileId) {
+  const payload = decodePayload(profile?.access);
+  const auth = payload?.['https://api.openai.com/auth'] || {};
+  const spaceId = profile?.accountId || auth?.chatgpt_account_id || profileId;
+  const planType = String(auth?.chatgpt_plan_type || '').toLowerCase() || null;
+  const planLabel = planType === 'team' ? 'Team' : planType === 'plus' ? 'Plus' : (planType || '未知');
+  return {
+    spaceId,
+    planType,
+    planLabel,
+  };
+}
+
 function getUsability(profile, profileId, lastGood) {
   const hasRefresh = Boolean(profile?.refresh);
   const unusableUntil = Number(profile?.unusableUntil || 0) || null;
@@ -352,20 +366,52 @@ function getUsability(profile, profileId, lastGood) {
   };
 }
 
+function getCodexOrder(store) {
+  const order = Array.isArray(store.order?.['openai-codex']) ? store.order['openai-codex'] : [];
+  return [...new Set(order.filter((id) => typeof id === 'string' && id && id !== 'openai-codex:default'))];
+}
+
+function setCodexOrder(store, order) {
+  store.order = store.order || {};
+  store.order['openai-codex'] = [...new Set(
+    (Array.isArray(order) ? order : [])
+      .filter((id) => typeof id === 'string' && id && id !== 'openai-codex:default' && store.profiles?.[id]),
+  )];
+  return store.order['openai-codex'];
+}
+
+function ensureLastGoodValid(store, { force = false } = {}) {
+  store.lastGood = store.lastGood || {};
+  const current = store.lastGood['openai-codex'];
+  if (!force && current && current !== 'openai-codex:default' && store.profiles?.[current]) {
+    return current;
+  }
+  const fallback = getCodexOrder(store).find((id) => store.profiles?.[id]) || null;
+  if (fallback) store.lastGood['openai-codex'] = fallback;
+  else delete store.lastGood['openai-codex'];
+  return fallback;
+}
+
 function buildProfiles() {
   const store = readStore();
   const usageCache = readUsageCache();
-  const order = Array.isArray(store.order?.['openai-codex']) ? store.order['openai-codex'] : [];
+  const panelState = readPanelState();
+  const order = getCodexOrder(store);
   const lastGood = store.lastGood?.['openai-codex'] || null;
+  const hiddenIds = new Set(panelState.hiddenProfiles || []);
   const rawProfiles = Object.entries(store.profiles || {})
     .filter(([id]) => id.startsWith('openai-codex:'))
     .map(([id, profile]) => {
       const email = getEmail(profile);
       const usability = getUsability(profile, id, lastGood);
+      const space = getProfileSpace(profile, id);
       return {
         profileId: id,
         email,
         accountId: profile.accountId || null,
+        spaceId: space.spaceId,
+        spaceType: space.planType,
+        spaceTypeLabel: space.planLabel,
         isDefaultSlot: id === 'openai-codex:default',
         isIndependent: id !== 'openai-codex:default',
         isLastGood: id === lastGood,
@@ -376,6 +422,7 @@ function buildProfiles() {
         usabilityText: usability.text,
         usabilityTone: usability.tone,
         canRelogin: id !== 'openai-codex:default' && !usability.usable,
+        isHidden: hiddenIds.has(id),
       };
     });
 
@@ -394,13 +441,16 @@ function buildProfiles() {
 
   const groupBuckets = new Map();
   for (const profile of profiles) {
-    const key = profile.accountId || profile.profileId;
+    const key = profile.spaceId || profile.accountId || profile.profileId;
     if (!groupBuckets.has(key)) groupBuckets.set(key, []);
     groupBuckets.get(key).push(profile);
   }
+  const groupTypeCounters = new Map();
   const groups = Array.from(groupBuckets.entries())
-    .map(([accountId, members]) => ({
-      accountId,
+    .map(([spaceId, members]) => ({
+      spaceId,
+      spaceType: members[0]?.spaceType || null,
+      spaceTypeLabel: members[0]?.spaceTypeLabel || '未知',
       memberCount: members.length,
       members: members.map((m) => ({
         profileId: m.profileId,
@@ -408,40 +458,62 @@ function buildProfiles() {
       })),
     }))
     .sort((a, b) => {
+      const aWeight = a.spaceType === 'team' ? 0 : a.spaceType === 'plus' ? 1 : 9;
+      const bWeight = b.spaceType === 'team' ? 0 : b.spaceType === 'plus' ? 1 : 9;
+      if (aWeight !== bWeight) return aWeight - bWeight;
       if (b.memberCount !== a.memberCount) return b.memberCount - a.memberCount;
-      return String(a.members[0]?.email || a.accountId).localeCompare(String(b.members[0]?.email || b.accountId));
+      return String(a.members[0]?.email || a.spaceId).localeCompare(String(b.members[0]?.email || b.spaceId));
     })
-    .map((group, index) => ({
-      ...group,
-      label: `G${index + 1}`,
-    }));
+    .map((group) => {
+      const key = group.spaceTypeLabel || '未知';
+      const next = (groupTypeCounters.get(key) || 0) + 1;
+      groupTypeCounters.set(key, next);
+      return {
+        ...group,
+        label: `${group.spaceTypeLabel} 空间 ${next}`,
+      };
+    });
 
-  const groupByAccountId = new Map(groups.map((group) => [group.accountId, group]));
+  const groupBySpaceId = new Map(groups.map((group) => [group.spaceId, group]));
   const annotatedProfiles = profiles.map((profile) => {
-    const group = groupByAccountId.get(profile.accountId || profile.profileId);
+    const group = groupBySpaceId.get(profile.spaceId || profile.accountId || profile.profileId);
     const usageEntry = usageCache.entries?.[usageKeyForProfile(profile.profileId, profile)] || null;
     return {
       ...profile,
       groupLabel: group?.label || null,
       groupMemberCount: group?.memberCount || 1,
       groupedWithOthers: (group?.memberCount || 1) > 1,
+      spaceLabel: group?.label || null,
       usage: buildUsageView(usageEntry),
     };
   });
 
-  const latestUsageTs = annotatedProfiles
+  const visibleProfiles = annotatedProfiles.filter((profile) => !profile.isHidden);
+  const hiddenProfiles = annotatedProfiles.filter((profile) => profile.isHidden);
+  const overlap = visibleProfiles.filter((profile) => hiddenIds.has(profile.profileId));
+  if (overlap.length) throw new Error('visible/hidden profile overlap');
+
+  const latestUsageTs = visibleProfiles
     .map((profile) => Number(profile.usage?.fetchedAt || 0) || 0)
     .reduce((max, value) => Math.max(max, value), 0) || null;
+
+  const visibleGroups = groups
+    .map((group) => ({
+      ...group,
+      members: (group.members || []).filter((member) => visibleProfiles.some((profile) => profile.profileId === member.profileId)),
+    }))
+    .filter((group) => group.members.length > 0)
+    .map((group) => ({ ...group, memberCount: group.members.length }));
 
   const usageSummary = {
     latestFetchedAt: latestUsageTs,
     latestFetchedAtText: formatDateTime(latestUsageTs),
-    liveCount: annotatedProfiles.filter((profile) => profile.usage?.source === 'live').length,
-    cacheCount: annotatedProfiles.filter((profile) => profile.usage?.source === 'cache').length,
-    errorCount: annotatedProfiles.filter((profile) => profile.usage?.source === 'error').length,
+    liveCount: visibleProfiles.filter((profile) => profile.usage?.source === 'live').length,
+    cacheCount: visibleProfiles.filter((profile) => profile.usage?.source === 'cache').length,
+    errorCount: visibleProfiles.filter((profile) => profile.usage?.source === 'error').length,
   };
 
-  return { order, lastGood, profiles: annotatedProfiles, groups, usageSummary };
+  return { order, lastGood, profiles: visibleProfiles, hiddenProfiles, groups: visibleGroups, usageSummary };
 }
 
 function formatDurationCompactMs(ms) {
@@ -487,113 +559,450 @@ function formatClockTime(ts) {
   }
 }
 
-function readCodexCallHistory(dateKeyInput) {
-  const dateKey = normalizeHistoryDateKey(dateKeyInput);
-  const store = readStore();
-  const profileMeta = new Map(
-    Object.entries(store.profiles || {})
-      .filter(([id]) => id.startsWith('openai-codex:'))
-      .map(([id, profile]) => [id, {
-        email: getEmail(profile) || id,
-        accountId: profile.accountId || null,
-      }]),
-  );
+function shiftHistoryDateKey(dateKey, deltaDays) {
+  const [year, month, day] = String(dateKey || shanghaiDateKey()).split('-').map(Number);
+  const dt = new Date(Date.UTC(year, (month || 1) - 1, day || 1));
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  return dt.toISOString().slice(0, 10);
+}
 
-  let lines = [];
-  try {
-    lines = fs.readFileSync(CALL_LOG_PATH, 'utf8').split(/\r?\n/).filter(Boolean);
-  } catch {
-    lines = [];
+function normalizeHistoryChannel(value, agentId = '') {
+  const raw = String(value || '').trim();
+  if (raw) return raw;
+  const agent = String(agentId || '').toLowerCase();
+  if (agent.includes('qq')) return 'qqbot';
+  if (agent.includes('telegram')) return 'telegram';
+  if (agent.includes('weixin') || agent === 'main') return 'openclaw-weixin';
+  return 'unknown';
+}
+
+function parseEventTimestamp(rawPrimary, rawFallback) {
+  const raw = rawPrimary ?? rawFallback ?? 0;
+  if (typeof raw === 'number') return raw;
+  return Number(raw || 0) || Date.parse(String(raw || '')) || 0;
+}
+
+function buildHistoryProfileMeta(store) {
+  const profiles = Object.entries(store.profiles || {})
+    .filter(([id]) => id.startsWith('openai-codex:'))
+    .map(([id, profile]) => {
+      const email = getEmail(profile) || id;
+      const space = getProfileSpace(profile, id);
+      return {
+        profileId: id,
+        email,
+        accountId: profile.accountId || space.spaceId || null,
+        spaceId: space.spaceId || id,
+        spaceType: space.planType || 'unknown',
+        spaceTypeLabel: space.planLabel || '未知',
+      };
+    });
+
+  const buckets = new Map();
+  for (const item of profiles) {
+    const key = item.spaceId || item.profileId;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(item);
   }
 
-  const events = [];
-  for (const line of lines) {
+  const counters = new Map();
+  const spaceLabelById = new Map();
+  Array.from(buckets.entries())
+    .map(([spaceId, members]) => ({
+      spaceId,
+      spaceType: members[0]?.spaceType || 'unknown',
+      spaceTypeLabel: members[0]?.spaceTypeLabel || '未知',
+      members,
+    }))
+    .sort((a, b) => {
+      const aWeight = a.spaceType === 'team' ? 0 : a.spaceType === 'plus' ? 1 : 9;
+      const bWeight = b.spaceType === 'team' ? 0 : b.spaceType === 'plus' ? 1 : 9;
+      if (aWeight !== bWeight) return aWeight - bWeight;
+      return String(a.members[0]?.email || a.spaceId).localeCompare(String(b.members[0]?.email || b.spaceId));
+    })
+    .forEach((group) => {
+      const key = group.spaceTypeLabel || '未知';
+      const next = (counters.get(key) || 0) + 1;
+      counters.set(key, next);
+      spaceLabelById.set(group.spaceId, `${group.spaceTypeLabel} 空间 ${next}`);
+    });
+
+  return new Map(profiles.map((item) => [item.profileId, {
+    email: item.email,
+    accountId: item.accountId,
+    spaceId: item.spaceId,
+    spaceTypeLabel: item.spaceTypeLabel,
+    spaceLabel: spaceLabelById.get(item.spaceId) || item.spaceTypeLabel || '未知空间',
+  }]));
+}
+
+function readCodexSessionBindings() {
+  let agentIds = [];
+  try {
+    agentIds = fs.readdirSync(AGENTS_ROOT, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    agentIds = [];
+  }
+
+  const bindingIndex = new Map();
+  for (const agentId of agentIds) {
+    const sessionsDir = path.join(AGENTS_ROOT, agentId, 'sessions');
+    const sessionsPath = path.join(sessionsDir, 'sessions.json');
+    if (!fs.existsSync(sessionsPath)) continue;
+    let raw;
     try {
-      const item = JSON.parse(line);
-      if (item.provider !== 'openai-codex') continue;
-      const ts = Number(item.ts || 0) || 0;
-      if (!ts || shanghaiDateKey(ts) !== dateKey) continue;
-      const meta = profileMeta.get(item.profileId) || {};
-      events.push({
-        ts,
-        timeText: formatClockTime(ts),
-        profileId: item.profileId || 'unknown',
-        email: meta.email || item.profileId || 'unknown',
-        accountId: meta.accountId || null,
-        model: item.model || 'unknown',
-        durationMs: Number(item.durationMs || 0) || 0,
-        durationText: formatDurationCompactMs(Number(item.durationMs || 0) || 0),
-        result: item.result || 'unknown',
-        stopReason: item.stopReason || null,
-        totalTokens: Number(item.totalTokens || 0) || 0,
-        promptTokens: Number(item.promptTokens || 0) || 0,
-        completionTokens: Number(item.completionTokens || 0) || 0,
-        sessionKey: item.sessionKey || null,
-        messageChannel: item.messageChannel || null,
-        runId: item.runId || null,
-      });
+      raw = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
     } catch {
-      // ignore broken lines
+      continue;
+    }
+    for (const [sessionKey, entry] of Object.entries(raw || {})) {
+      const profileId = String(entry?.authProfileOverride || '');
+      const sessionId = String(entry?.sessionId || '');
+      const sessionFile = String(entry?.sessionFile || (sessionId ? path.join(sessionsDir, `${sessionId}.jsonl`) : ''));
+      if (!sessionFile) continue;
+      bindingIndex.set(sessionFile, {
+        agentId,
+        sessionKey,
+        sessionId: sessionId || null,
+        sessionFile,
+        profileId: profileId.startsWith('openai-codex:') ? profileId : null,
+        messageChannel: normalizeHistoryChannel(entry?.deliveryContext?.channel || entry?.lastChannel || entry?.origin?.provider, agentId),
+      });
     }
   }
 
+  const bindings = [];
+  const seenSessionFiles = new Set();
+  for (const agentId of agentIds) {
+    const sessionsDir = path.join(AGENTS_ROOT, agentId, 'sessions');
+    if (!fs.existsSync(sessionsDir)) continue;
+    let filenames = [];
+    try {
+      filenames = fs.readdirSync(sessionsDir).filter((name) => name.endsWith('.jsonl'));
+    } catch {
+      filenames = [];
+    }
+    for (const filename of filenames) {
+      const sessionFile = path.join(sessionsDir, filename);
+      if (seenSessionFiles.has(sessionFile)) continue;
+      seenSessionFiles.add(sessionFile);
+      const indexed = bindingIndex.get(sessionFile);
+      bindings.push(indexed || {
+        agentId,
+        sessionKey: null,
+        sessionId: path.basename(filename, '.jsonl'),
+        sessionFile,
+        profileId: null,
+        messageChannel: normalizeHistoryChannel(null, agentId),
+      });
+    }
+  }
+  return bindings;
+}
+
+function readCodexEventsFromSessions(dateKey, profileMeta) {
+  const events = [];
+  for (const binding of readCodexSessionBindings()) {
+    if (!fs.existsSync(binding.sessionFile)) continue;
+    let lines = [];
+    try {
+      lines = fs.readFileSync(binding.sessionFile, 'utf8').split(/\r?\n/).filter(Boolean);
+    } catch {
+      lines = [];
+    }
+    for (const line of lines) {
+      try {
+        const item = JSON.parse(line);
+        if (item?.type !== 'message') continue;
+        const msg = item.message || {};
+        if (msg?.role !== 'assistant') continue;
+        if (msg?.provider !== 'openai-codex') continue;
+        if (!msg?.usage || typeof msg.usage !== 'object') continue;
+        const ts = parseEventTimestamp(msg.timestamp, item.timestamp);
+        if (!ts || shanghaiDateKey(ts) !== dateKey) continue;
+        const resolvedProfileId = binding.profileId || 'openai-codex:unknown';
+        const meta = profileMeta.get(resolvedProfileId) || {
+          email: '未识别账号',
+          accountId: null,
+          spaceId: 'unknown',
+          spaceTypeLabel: '未知',
+          spaceLabel: '未识别空间',
+        };
+        const stopReason = msg.stopReason || null;
+        const result = stopReason === 'error' ? 'error' : 'ok';
+        events.push({
+          ts,
+          timeText: formatClockTime(ts),
+          profileId: resolvedProfileId,
+          email: meta.email || resolvedProfileId,
+          accountId: meta.accountId || null,
+          spaceId: meta.spaceId || 'unknown',
+          spaceTypeLabel: meta.spaceTypeLabel || '未知',
+          spaceLabel: meta.spaceLabel || '未识别空间',
+          model: msg.model || 'unknown',
+          durationMs: 0,
+          durationText: '—',
+          result,
+          stopReason,
+          totalTokens: Number(msg.usage?.totalTokens || 0) || 0,
+          promptTokens: Number(msg.usage?.input || 0) || 0,
+          completionTokens: Number(msg.usage?.output || 0) || 0,
+          costTotal: Number(msg.usage?.cost?.total || 0) || 0,
+          sessionKey: binding.sessionKey || null,
+          messageChannel: normalizeHistoryChannel(binding.messageChannel, binding.agentId),
+          runId: msg.responseId || null,
+          source: 'session',
+        });
+      } catch {
+        // ignore broken lines
+      }
+    }
+  }
+  return events;
+}
+
+function readCodexCallHistory(dateKeyInput) {
+  const dateKey = normalizeHistoryDateKey(dateKeyInput);
+  const store = readStore();
+  const profileMeta = buildHistoryProfileMeta(store);
+
+  let events = [];
+  if (fs.existsSync(CALL_LOG_PATH)) {
+    let lines = [];
+    try {
+      lines = fs.readFileSync(CALL_LOG_PATH, 'utf8').split(/\r?\n/).filter(Boolean);
+    } catch {
+      lines = [];
+    }
+    for (const line of lines) {
+      try {
+        const item = JSON.parse(line);
+        if (item.provider !== 'openai-codex') continue;
+        const ts = Number(item.ts || 0) || 0;
+        if (!ts || shanghaiDateKey(ts) !== dateKey) continue;
+        const resolvedProfileId = item.profileId || 'openai-codex:unknown';
+        const meta = profileMeta.get(resolvedProfileId) || {
+          email: resolvedProfileId,
+          accountId: null,
+          spaceId: 'unknown',
+          spaceTypeLabel: '未知',
+          spaceLabel: '未识别空间',
+        };
+        events.push({
+          ts,
+          timeText: formatClockTime(ts),
+          profileId: resolvedProfileId,
+          email: meta.email || resolvedProfileId,
+          accountId: meta.accountId || null,
+          spaceId: meta.spaceId || 'unknown',
+          spaceTypeLabel: meta.spaceTypeLabel || '未知',
+          spaceLabel: meta.spaceLabel || '未识别空间',
+          model: item.model || 'unknown',
+          durationMs: Number(item.durationMs || 0) || 0,
+          durationText: formatDurationCompactMs(Number(item.durationMs || 0) || 0),
+          result: item.result || 'unknown',
+          stopReason: item.stopReason || null,
+          totalTokens: Number(item.totalTokens || 0) || 0,
+          promptTokens: Number(item.promptTokens || 0) || 0,
+          completionTokens: Number(item.completionTokens || 0) || 0,
+          costTotal: Number(item.costTotal || 0) || 0,
+          sessionKey: item.sessionKey || null,
+          messageChannel: normalizeHistoryChannel(item.messageChannel),
+          runId: item.runId || null,
+          source: 'usage-log',
+        });
+      } catch {
+        // ignore broken lines
+      }
+    }
+  } else {
+    events = readCodexEventsFromSessions(dateKey, profileMeta);
+  }
+
+  const buildSummaryList = (rows, sortKey = 'totalTokens') => Array.from(rows.values())
+    .map((item) => ({
+      ...item,
+      totalDurationText: item.totalDurationMs > 0 ? formatDurationCompactMs(item.totalDurationMs) : '—',
+      totalCostText: item.totalCost > 0 ? `$${item.totalCost.toFixed(4)}` : null,
+      lastAtText: formatDateTime(item.lastAt),
+    }))
+    .sort((a, b) => {
+      if ((b[sortKey] || 0) !== (a[sortKey] || 0)) return (b[sortKey] || 0) - (a[sortKey] || 0);
+      if (b.calls !== a.calls) return b.calls - a.calls;
+      return String(a.label || a.email || a.profileId).localeCompare(String(b.label || b.email || b.profileId));
+    });
+
   events.sort((a, b) => b.ts - a.ts);
   const byProfileMap = new Map();
+  const bySpaceMap = new Map();
+  const byChannelMap = new Map();
   for (const event of events) {
-    const current = byProfileMap.get(event.profileId) || {
+    const profileCurrent = byProfileMap.get(event.profileId) || {
       profileId: event.profileId,
       email: event.email,
       accountId: event.accountId,
+      spaceId: event.spaceId,
+      spaceLabel: event.spaceLabel,
       calls: 0,
       totalDurationMs: 0,
+      totalTokens: 0,
+      totalCost: 0,
       okCalls: 0,
       errorCalls: 0,
       lastAt: 0,
     };
-    current.calls += 1;
-    current.totalDurationMs += event.durationMs;
-    if (event.result === 'ok') current.okCalls += 1;
-    else current.errorCalls += 1;
-    current.lastAt = Math.max(current.lastAt, event.ts);
-    byProfileMap.set(event.profileId, current);
+    profileCurrent.calls += 1;
+    profileCurrent.totalDurationMs += event.durationMs;
+    profileCurrent.totalTokens += Number(event.totalTokens || 0) || 0;
+    profileCurrent.totalCost += Number(event.costTotal || 0) || 0;
+    if (event.result === 'ok') profileCurrent.okCalls += 1;
+    else profileCurrent.errorCalls += 1;
+    profileCurrent.lastAt = Math.max(profileCurrent.lastAt, event.ts);
+    byProfileMap.set(event.profileId, profileCurrent);
+
+    const spaceKey = event.spaceId || 'unknown';
+    const spaceCurrent = bySpaceMap.get(spaceKey) || {
+      key: spaceKey,
+      label: event.spaceLabel || '未识别空间',
+      spaceTypeLabel: event.spaceTypeLabel || '未知',
+      calls: 0,
+      totalTokens: 0,
+      totalCost: 0,
+      lastAt: 0,
+    };
+    spaceCurrent.calls += 1;
+    spaceCurrent.totalTokens += Number(event.totalTokens || 0) || 0;
+    spaceCurrent.totalCost += Number(event.costTotal || 0) || 0;
+    spaceCurrent.lastAt = Math.max(spaceCurrent.lastAt, event.ts);
+    bySpaceMap.set(spaceKey, spaceCurrent);
+
+    const channelKey = normalizeHistoryChannel(event.messageChannel);
+    const channelCurrent = byChannelMap.get(channelKey) || {
+      key: channelKey,
+      label: channelKey,
+      calls: 0,
+      totalTokens: 0,
+      totalCost: 0,
+      lastAt: 0,
+    };
+    channelCurrent.calls += 1;
+    channelCurrent.totalTokens += Number(event.totalTokens || 0) || 0;
+    channelCurrent.totalCost += Number(event.costTotal || 0) || 0;
+    channelCurrent.lastAt = Math.max(channelCurrent.lastAt, event.ts);
+    byChannelMap.set(channelKey, channelCurrent);
   }
 
-  const byProfile = Array.from(byProfileMap.values())
-    .map((item) => ({
-      ...item,
-      totalDurationText: formatDurationCompactMs(item.totalDurationMs),
-      lastAtText: formatDateTime(item.lastAt),
-    }))
-    .sort((a, b) => {
-      if (b.totalDurationMs !== a.totalDurationMs) return b.totalDurationMs - a.totalDurationMs;
-      if (b.calls !== a.calls) return b.calls - a.calls;
-      return String(a.email || a.profileId).localeCompare(String(b.email || b.profileId));
-    });
+  const byProfile = buildSummaryList(byProfileMap, 'totalTokens');
+  const bySpace = buildSummaryList(bySpaceMap, 'totalTokens');
+  const byChannel = buildSummaryList(byChannelMap, 'totalTokens');
 
   const totalDurationMs = events.reduce((sum, event) => sum + event.durationMs, 0);
+  const totalTokens = events.reduce((sum, event) => sum + (Number(event.totalTokens || 0) || 0), 0);
+  const totalCost = events.reduce((sum, event) => sum + (Number(event.costTotal || 0) || 0), 0);
   return {
     dateKey,
     totalCalls: events.length,
     totalDurationMs,
-    totalDurationText: formatDurationCompactMs(totalDurationMs),
+    totalDurationText: totalDurationMs > 0 ? formatDurationCompactMs(totalDurationMs) : '—',
+    totalTokens,
+    totalCost,
+    totalCostText: totalCost > 0 ? `$${totalCost.toFixed(4)}` : null,
     profileCount: byProfile.length,
+    spaceCount: bySpace.length,
+    channelCount: byChannel.length,
     okCalls: events.filter((event) => event.result === 'ok').length,
     errorCalls: events.filter((event) => event.result !== 'ok').length,
+    source: fs.existsSync(CALL_LOG_PATH) ? 'usage-log' : 'session-transcript',
     byProfile,
-    events: events.slice(0, 120),
+    bySpace,
+    byChannel,
+    events: events.slice(0, 160),
+  };
+}
+
+function readCodexHistoryWindow(daysInput = 14, endDateInput) {
+  const days = Math.max(3, Math.min(60, Number(daysInput || 14) || 14));
+  const endDateKey = normalizeHistoryDateKey(endDateInput);
+  const startDateKey = shiftHistoryDateKey(endDateKey, -(days - 1));
+  const counts = new Map();
+
+  for (const binding of readCodexSessionBindings()) {
+    if (!fs.existsSync(binding.sessionFile)) continue;
+    let lines = [];
+    try {
+      lines = fs.readFileSync(binding.sessionFile, 'utf8').split(/\r?\n/).filter(Boolean);
+    } catch {
+      lines = [];
+    }
+    for (const line of lines) {
+      try {
+        const item = JSON.parse(line);
+        if (item?.type !== 'message') continue;
+        const msg = item.message || {};
+        if (msg?.role !== 'assistant') continue;
+        if (msg?.provider !== 'openai-codex') continue;
+        if (!msg?.usage || typeof msg.usage !== 'object') continue;
+        const ts = parseEventTimestamp(msg.timestamp, item.timestamp);
+        if (!ts) continue;
+        const key = shanghaiDateKey(ts);
+        if (key < startDateKey || key > endDateKey) continue;
+        const bucket = counts.get(key) || {
+          dateKey: key,
+          totalCalls: 0,
+          totalTokens: 0,
+          totalCost: 0,
+        };
+        bucket.totalCalls += 1;
+        bucket.totalTokens += Number(msg.usage?.totalTokens || 0) || 0;
+        bucket.totalCost += Number(msg.usage?.cost?.total || 0) || 0;
+        counts.set(key, bucket);
+      } catch {
+        // ignore broken lines
+      }
+    }
+  }
+
+  const dayRows = [];
+  for (let i = 0; i < days; i += 1) {
+    const key = shiftHistoryDateKey(startDateKey, i);
+    const bucket = counts.get(key) || { dateKey: key, totalCalls: 0, totalTokens: 0, totalCost: 0 };
+    dayRows.push({
+      ...bucket,
+      totalCostText: bucket.totalCost > 0 ? `$${bucket.totalCost.toFixed(4)}` : null,
+    });
+  }
+
+  const activeDates = Array.from(counts.keys()).sort((a, b) => b.localeCompare(a));
+  return {
+    startDateKey,
+    endDateKey,
+    activeDates,
+    days: dayRows,
+  };
+}
+
+function normalizePanelState(raw) {
+  const hiddenProfiles = Array.isArray(raw?.hiddenProfiles)
+    ? [...new Set(raw.hiddenProfiles.filter((id) => typeof id === 'string' && id && id !== 'openai-codex:default'))]
+    : [];
+  return {
+    loginJob: raw?.loginJob ?? null,
+    hiddenProfiles,
   };
 }
 
 function readPanelState() {
   try {
-    return JSON.parse(fs.readFileSync(PANEL_STATE_PATH, 'utf8'));
+    return normalizePanelState(JSON.parse(fs.readFileSync(PANEL_STATE_PATH, 'utf8')));
   } catch {
-    return { loginJob: null };
+    return normalizePanelState({ loginJob: null });
   }
 }
 
 function writePanelState(next) {
-  fs.writeFileSync(PANEL_STATE_PATH, JSON.stringify(next, null, 2) + '\n');
+  fs.writeFileSync(PANEL_STATE_PATH, JSON.stringify(normalizePanelState(next), null, 2) + '\n');
 }
 
 function isPidRunning(pid) {
@@ -705,7 +1114,7 @@ function startLoginJob(targetEmail = '') {
     targetEmail: safeTargetEmail || null,
   };
   fs.writeFileSync(LOGIN_TRIGGER_PATH, String(Date.now()), 'utf8');
-  writePanelState({ loginJob: nextJob });
+  writePanelState({ ...readPanelState(), loginJob: nextJob });
   return { alreadyRunning: false, job: { ...nextJob, running: true } };
 }
 
@@ -716,7 +1125,7 @@ function stopLoginJob() {
   try {
     process.kill(job.pid, 'SIGTERM');
   } catch {}
-  writePanelState({ loginJob: null });
+  writePanelState({ ...readPanelState(), loginJob: null });
   return { stopped: true, note: job.mode === 'terminal' ? '已清空面板状态；如果 Terminal 里还在跑，请手动关闭那个终端页。' : '' };
 }
 
@@ -750,11 +1159,119 @@ function promoteProfile(profileId) {
   if (!ids.includes(profileId)) {
     throw new Error(`profile 不存在: ${profileId}`);
   }
-  store.order = store.order || {};
-  const current = Array.isArray(store.order['openai-codex']) ? store.order['openai-codex'] : [];
-  store.order['openai-codex'] = [profileId, ...current.filter((id) => id !== profileId)];
+  const order = getCodexOrder(store);
+  setCodexOrder(store, [profileId, ...order.filter((id) => id !== profileId)]);
   const backup = writeStore(store);
-  return { backup, order: store.order['openai-codex'] };
+  return { backup, order: getCodexOrder(store) };
+}
+
+function hideProfile(profileId) {
+  const store = readStore();
+  const panelState = readPanelState();
+  if (!store.profiles?.[profileId]) {
+    throw new Error(`profile 不存在: ${profileId}`);
+  }
+  if (profileId === 'openai-codex:default') {
+    throw new Error('default 槽位不支持移出轮换，请使用彻底删除');
+  }
+  const hidden = new Set(panelState.hiddenProfiles || []);
+  hidden.add(profileId);
+  setCodexOrder(store, getCodexOrder(store).filter((id) => id !== profileId));
+  if (store.lastGood?.['openai-codex'] === profileId) {
+    ensureLastGoodValid(store, { force: true });
+  }
+  const backupPath = writeStore(store);
+  writePanelState({ ...panelState, hiddenProfiles: [...hidden] });
+  return { ...buildProfiles(), backupPath };
+}
+
+function restoreProfile(profileId) {
+  const store = readStore();
+  const panelState = readPanelState();
+  if (!store.profiles?.[profileId]) {
+    throw new Error(`profile 不存在: ${profileId}`);
+  }
+  if (profileId === 'openai-codex:default') {
+    throw new Error('default 槽位不存在恢复场景');
+  }
+  const hidden = new Set(panelState.hiddenProfiles || []);
+  hidden.delete(profileId);
+  const order = getCodexOrder(store);
+  if (!order.includes(profileId)) {
+    setCodexOrder(store, [...order, profileId]);
+  }
+  if (!store.lastGood?.['openai-codex']) {
+    ensureLastGoodValid(store, { force: true });
+  }
+  const backupPath = writeStore(store);
+  writePanelState({ ...panelState, hiddenProfiles: [...hidden] });
+  return { ...buildProfiles(), backupPath };
+}
+
+function deleteUsageEntry(cache, profileId) {
+  if (!cache?.entries || !profileId) return;
+  delete cache.entries[profileId];
+}
+
+function moveUsageEntry(cache, fromProfileId, toProfileId) {
+  if (!cache?.entries || !fromProfileId || !toProfileId) return;
+  if (cache.entries[fromProfileId]) {
+    cache.entries[toProfileId] = cache.entries[fromProfileId];
+    delete cache.entries[fromProfileId];
+  }
+}
+
+function deleteProfile(profileId, confirm) {
+  if (confirm !== true) {
+    throw new Error('彻底删除需要二次确认');
+  }
+  const store = readStore();
+  const panelState = readPanelState();
+  const usageCache = readUsageCache();
+  if (!store.profiles?.[profileId]) {
+    throw new Error(`profile 不存在: ${profileId}`);
+  }
+
+  const isDefault = profileId === 'openai-codex:default';
+  const currentLastGood = store.lastGood?.['openai-codex'] || null;
+  delete store.profiles[profileId];
+  setCodexOrder(store, getCodexOrder(store).filter((id) => id !== profileId));
+  deleteUsageEntry(usageCache, profileId);
+
+  let defaultReplacedBy = null;
+  let defaultMissing = false;
+  if (isDefault) {
+    const replacementId = getCodexOrder(store).find((id) => store.profiles?.[id]) || null;
+    if (replacementId) {
+      store.profiles['openai-codex:default'] = { ...store.profiles[replacementId] };
+      delete store.profiles[replacementId];
+      setCodexOrder(store, getCodexOrder(store).filter((id) => id !== replacementId));
+      moveUsageEntry(usageCache, replacementId, 'openai-codex:default');
+      defaultReplacedBy = replacementId;
+    } else {
+      defaultMissing = true;
+    }
+  }
+
+  const hidden = new Set(panelState.hiddenProfiles || []);
+  hidden.delete(profileId);
+  if (defaultReplacedBy) hidden.delete(defaultReplacedBy);
+  writePanelState({ ...panelState, hiddenProfiles: [...hidden] });
+
+  const shouldForceLastGood = currentLastGood === profileId || (defaultReplacedBy && currentLastGood === defaultReplacedBy);
+  ensureLastGoodValid(store, { force: Boolean(shouldForceLastGood) });
+  const backupPath = writeStore(store);
+  usageCache.lastUpdatedAt = Date.now();
+  writeUsageCache(usageCache);
+
+  return {
+    ...buildProfiles(),
+    ok: true,
+    backupPath,
+    defaultReplacedBy,
+    defaultMissing,
+    warning: defaultMissing ? 'default 已删除，当前没有可顶替账号，请重新登录新账号' : null,
+  };
 }
 
 const HTML = `<!doctype html>
@@ -811,7 +1328,31 @@ const HTML = `<!doctype html>
     .historyItemTitle{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
     .historyMeta{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
     .historyEmpty{padding:16px;border:1px dashed #32405e;border-radius:14px;color:var(--muted);background:#0c1425}
-    @media (max-width: 900px){.grid,.historyGrid{grid-template-columns:1fr}}
+    .statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:4px 0 16px}
+    .statCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628}
+    .statLabel{font-size:12px;color:var(--muted);margin-bottom:8px}.statValue{font-size:24px;font-weight:800}
+    .historyVizGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}
+    .vizCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628}
+    .donutWrap{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+    .donut{width:132px;height:132px;border-radius:50%;position:relative;flex:0 0 auto}
+    .donut::after{content:'';position:absolute;inset:22px;border-radius:50%;background:#0f1628;border:1px solid #24304d}
+    .legend{display:flex;flex-direction:column;gap:8px;min-width:220px;flex:1}
+    .legendRow{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted)}
+    .legendLeft{display:flex;align-items:center;gap:8px;min-width:0}.swatch{width:10px;height:10px;border-radius:999px;flex:0 0 auto}
+    .trendCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628;margin-bottom:16px}
+    .trendBars{display:flex;align-items:flex-end;gap:8px;height:150px;margin-top:12px;overflow-x:auto;padding-bottom:8px}
+    .trendBarCol{display:flex;flex-direction:column;align-items:center;gap:8px;min-width:36px}
+    .trendBar{width:100%;min-height:6px;border-radius:10px;background:linear-gradient(180deg,#6ea8fe,#2e6de6)}
+    .trendLabel{font-size:11px;color:var(--muted)}
+    .pivotCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:#0f1628;margin-bottom:16px}
+    .pivotTableWrap{overflow:auto}
+    table.pivotTable{width:100%;border-collapse:collapse;font-size:13px}
+    .pivotTable th,.pivotTable td{padding:10px 12px;border-bottom:1px solid #22304d;text-align:left;white-space:nowrap}
+    .pivotTable th{color:var(--muted);font-weight:600;position:sticky;top:0;background:#0f1628}
+    .segBtns{display:flex;gap:8px;flex-wrap:wrap}
+    .segBtns button.active{background:linear-gradient(180deg,#4a8cff,#2e6de6);border-color:#2e6de6}
+    button.danger{background:#4a2230;border-color:#8b4256}
+    @media (max-width: 900px){.grid,.historyGrid,.historyVizGrid,.statsGrid{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -837,6 +1378,11 @@ const HTML = `<!doctype html>
         </div>
         <div id="groupSummary" class="muted" style="margin-bottom:12px">加载分组中…</div>
         <div id="profiles" class="cards"></div>
+        <div style="margin-top:18px">
+          <div class="title" style="font-size:18px;margin-bottom:8px">已隐藏账号</div>
+          <div class="muted" style="margin-bottom:12px">这里是已移出轮换的账号，可恢复或彻底删除。</div>
+          <div id="hiddenProfiles" class="cards"></div>
+        </div>
       </div>
 
       <div class="card">
@@ -868,6 +1414,45 @@ const HTML = `<!doctype html>
         <input id="historyDateInput" type="date" />
         <button id="historyRefreshBtn">刷新调用记录</button>
       </div>
+      <div id="historyOverview" class="statsGrid"></div>
+      <div class="trendCard">
+        <div class="row">
+          <div>
+            <div class="usageTitle">近 14 天趋势</div>
+            <div class="usageMeta">如果某天为 0，说明当天没有命中到可识别的 Codex 调用记录。</div>
+          </div>
+          <div id="historyActiveDates" class="muted"></div>
+        </div>
+        <div id="historyTrend" class="trendBars"></div>
+      </div>
+      <div class="historyVizGrid">
+        <div class="vizCard">
+          <div class="usageTitle" style="margin-bottom:10px">按空间分布</div>
+          <div id="historySpaceChart"></div>
+        </div>
+        <div class="vizCard">
+          <div class="usageTitle" style="margin-bottom:10px">按渠道分布</div>
+          <div id="historyChannelChart"></div>
+        </div>
+        <div class="vizCard">
+          <div class="usageTitle" style="margin-bottom:10px">按账号分布</div>
+          <div id="historyProfileChart"></div>
+        </div>
+      </div>
+      <div class="pivotCard">
+        <div class="row" style="margin-bottom:10px">
+          <div>
+            <div class="usageTitle">数据透视</div>
+            <div class="usageMeta">切换维度看同一天的账号 / 空间 / 渠道表现。</div>
+          </div>
+          <div class="segBtns">
+            <button id="pivotProfilesBtn" class="active">账号</button>
+            <button id="pivotSpacesBtn">空间</button>
+            <button id="pivotChannelsBtn">渠道</button>
+          </div>
+        </div>
+        <div id="historyPivot" class="pivotTableWrap"></div>
+      </div>
       <div class="historyGrid">
         <div>
           <div class="usageTitle" style="margin-bottom:10px">按账号汇总</div>
@@ -894,6 +1479,7 @@ const HTML = `<!doctype html>
     const refreshBtn = document.getElementById('refreshBtn');
     const quotaRefreshBtn = document.getElementById('quotaRefreshBtn');
     const stopBtn = document.getElementById('stopBtn');
+    const hiddenProfilesEl = document.getElementById('hiddenProfiles');
     const historySummaryEl = document.getElementById('historySummary');
     const historyProfilesEl = document.getElementById('historyProfiles');
     const historyEventsEl = document.getElementById('historyEvents');
@@ -902,7 +1488,18 @@ const HTML = `<!doctype html>
     const historyNextBtn = document.getElementById('historyNextBtn');
     const historyDateInputEl = document.getElementById('historyDateInput');
     const historyRefreshBtn = document.getElementById('historyRefreshBtn');
+    const historyOverviewEl = document.getElementById('historyOverview');
+    const historyTrendEl = document.getElementById('historyTrend');
+    const historyActiveDatesEl = document.getElementById('historyActiveDates');
+    const historySpaceChartEl = document.getElementById('historySpaceChart');
+    const historyChannelChartEl = document.getElementById('historyChannelChart');
+    const historyProfileChartEl = document.getElementById('historyProfileChart');
+    const historyPivotEl = document.getElementById('historyPivot');
+    const pivotProfilesBtn = document.getElementById('pivotProfilesBtn');
+    const pivotSpacesBtn = document.getElementById('pivotSpacesBtn');
+    const pivotChannelsBtn = document.getElementById('pivotChannelsBtn');
     let currentHistoryDateKey = todayDateKey();
+    let currentPivotDimension = 'profile';
 
     async function api(url, options = {}) {
       const res = await fetch(url, {
@@ -1014,21 +1611,28 @@ const HTML = `<!doctype html>
         '</div>';
     }
 
-    function profileCard(profile) {
+    function profileCard(profile, { hidden = false } = {}) {
       const badges = [];
       if (profile.isDefaultSlot) badges.push(badge('default 槽位', 'warn'));
       if (profile.isLastGood) badges.push(badge('最近实际可用', 'good'));
-      if (profile.orderIndex >= 0) badges.push(badge('顺位 #' + (profile.orderIndex + 1)));
-      if (profile.groupLabel) {
-        badges.push(badge('分组 ' + profile.groupLabel + (profile.groupedWithOthers ? (' · ' + profile.groupMemberCount + ' 个') : '')));
+      if (!hidden && profile.orderIndex >= 0) badges.push(badge('顺位 #' + (profile.orderIndex + 1)));
+      if (profile.spaceLabel) {
+        badges.push(badge(profile.spaceLabel + (profile.groupedWithOthers ? (' · ' + profile.groupMemberCount + ' 个') : '')));
       }
+      if (hidden) badges.push(badge('已隐藏', 'warn'));
       badges.push(badge(profile.usabilityText || '状态未知', profile.usabilityTone || ''));
-      const canPromote = !profile.isDefaultSlot;
+      const canPromote = !hidden && !profile.isDefaultSlot;
       const actions = [];
       actions.push('<button ' + (canPromote ? '' : 'disabled') + ' data-promote="' + profile.profileId + '">置顶到第一优先级</button>');
       if (profile.canRelogin) {
         actions.push('<button data-relogin="' + profile.profileId + '" data-email="' + (profile.email || '') + '">重新登录</button>');
       }
+      if (hidden) {
+        actions.push('<button class="warn" data-restore="' + profile.profileId + '">恢复</button>');
+      } else if (!profile.isDefaultSlot) {
+        actions.push('<button class="warn" data-hide="' + profile.profileId + '">移出轮换</button>');
+      }
+      actions.push('<button class="danger" data-delete="' + profile.profileId + '" data-email="' + (profile.email || profile.profileId) + '" data-default="' + (profile.isDefaultSlot ? '1' : '0') + '">彻底删除</button>');
       return '' +
         '<div class="profile">' +
           '<div class="row">' +
@@ -1040,7 +1644,8 @@ const HTML = `<!doctype html>
           '</div>' +
           '<div class="tags">' + badges.join('') + '</div>' +
           '<div class="list" style="margin-top:10px">' +
-            '<div class="kv"><span class="muted">accountId</span><code>' + (profile.accountId || 'unknown') + '</code></div>' +
+            '<div class="kv"><span class="muted">空间类型</span><code>' + (profile.spaceTypeLabel || '未知') + '</code></div>' +
+            '<div class="kv"><span class="muted">spaceId</span><code>' + (profile.spaceId || profile.accountId || 'unknown') + '</code></div>' +
           '</div>' +
           renderUsage(profile) +
         '</div>';
@@ -1055,12 +1660,17 @@ const HTML = `<!doctype html>
         typeof usageSummary.cacheCount === 'number' && usageSummary.cacheCount > 0 ? ('缓存 ' + usageSummary.cacheCount) : null,
         typeof usageSummary.errorCount === 'number' && usageSummary.errorCount > 0 ? ('失败 ' + usageSummary.errorCount) : null,
       ].filter(Boolean).join(' · ');
-      summaryEl.textContent = '共 ' + state.profiles.length + ' 个 Codex 条目，独立轮换 ' + state.profiles.filter((p) => p.isIndependent).length + ' 个 · ' + usageText;
+      summaryEl.textContent = '共 ' + state.profiles.length + ' 个 Codex 条目，实际空间 ' + ((state.groups || []).length) + ' 个，独立轮换 ' + state.profiles.filter((p) => p.isIndependent).length + ' 个 · ' + usageText;
       groupSummaryEl.textContent = (state.groups || []).map((group) => {
         const emails = (group.members || []).map((m) => m.email || m.profileId).join(' / ');
-        return group.label + '：' + emails;
+        return group.label + '（' + group.memberCount + ' 个）：' + emails;
       }).join('   ｜   ') || '暂无分组信息';
-      profilesEl.innerHTML = state.profiles.map(profileCard).join('');
+      profilesEl.innerHTML = state.profiles.length
+        ? state.profiles.map((profile) => profileCard(profile, { hidden: false })).join('')
+        : '<div class="historyEmpty">当前没有可见 Codex 账号。</div>';
+      hiddenProfilesEl.innerHTML = (state.hiddenProfiles || []).length
+        ? state.hiddenProfiles.map((profile) => profileCard(profile, { hidden: true })).join('')
+        : '<div class="historyEmpty">暂无已隐藏账号。</div>';
       profilesEl.querySelectorAll('[data-promote]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const profileId = btn.getAttribute('data-promote');
@@ -1095,6 +1705,82 @@ const HTML = `<!doctype html>
           }
         });
       });
+      document.querySelectorAll('[data-hide]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const profileId = btn.getAttribute('data-hide');
+          btn.disabled = true;
+          try {
+            await api('/api/profile/hide', {
+              method: 'POST',
+              body: JSON.stringify({ profileId }),
+            });
+            await loadState();
+          } catch (err) {
+            alert(err.message);
+            btn.disabled = false;
+          }
+        });
+      });
+      document.querySelectorAll('[data-restore]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const profileId = btn.getAttribute('data-restore');
+          btn.disabled = true;
+          try {
+            await api('/api/profile/restore', {
+              method: 'POST',
+              body: JSON.stringify({ profileId }),
+            });
+            await loadState();
+          } catch (err) {
+            alert(err.message);
+            btn.disabled = false;
+          }
+        });
+      });
+      document.querySelectorAll('[data-delete]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const profileId = btn.getAttribute('data-delete');
+          const email = btn.getAttribute('data-email') || profileId;
+          const isDefault = btn.getAttribute('data-default') === '1';
+          if (btn.dataset.confirmDelete !== '1') {
+            btn.dataset.confirmDelete = '1';
+            btn.dataset.originalText = btn.textContent || '彻底删除';
+            btn.textContent = isDefault ? '再次确认删除 default' : '再次确认彻底删除';
+            btn.title = isDefault
+              ? ('将删除 default 槽位：' + email + '；系统会自动尝试用轮换第一位顶替。')
+              : ('将彻底删除账号：' + email + '。');
+            setTimeout(() => {
+              if (btn.dataset.confirmDelete === '1' && !btn.disabled) {
+                btn.dataset.confirmDelete = '0';
+                btn.textContent = btn.dataset.originalText || '彻底删除';
+                btn.title = '';
+              }
+            }, 5000);
+            return;
+          }
+          btn.disabled = true;
+          try {
+            const data = await api('/api/profile/delete', {
+              method: 'POST',
+              body: JSON.stringify({ profileId, confirm: true }),
+            });
+            await loadState();
+            if (data.defaultMissing) {
+              alert(data.warning || 'default 已删除，当前没有可顶替账号，请重新登录新账号。');
+            } else if (data.defaultReplacedBy) {
+              alert('已删除 default，并自动由 ' + data.defaultReplacedBy + ' 顶替。');
+            } else if (data.backupPath) {
+              alert('删除完成，备份已写入：' + data.backupPath);
+            }
+          } catch (err) {
+            alert(err.message);
+            btn.disabled = false;
+            btn.dataset.confirmDelete = '0';
+            btn.textContent = btn.dataset.originalText || '彻底删除';
+            btn.title = '';
+          }
+        });
+      });
       renderJob(job);
     }
 
@@ -1115,20 +1801,127 @@ const HTML = `<!doctype html>
       }
     }
 
+    function formatMetricNumber(value) {
+      return new Intl.NumberFormat('zh-CN').format(Number(value || 0) || 0);
+    }
+
+    function renderHistoryOverview(data) {
+      const cards = [
+        { label: '调用次数', value: formatMetricNumber(data.totalCalls || 0) },
+        { label: 'Tokens', value: formatMetricNumber(data.totalTokens || 0) },
+        { label: '粗略成本', value: data.totalCostText || '—' },
+        { label: '账号 / 空间 / 渠道', value: (data.profileCount || 0) + ' / ' + (data.spaceCount || 0) + ' / ' + (data.channelCount || 0) },
+      ];
+      historyOverviewEl.innerHTML = cards.map((item) => '' +
+        '<div class="statCard">' +
+          '<div class="statLabel">' + escapeHtml(item.label) + '</div>' +
+          '<div class="statValue">' + escapeHtml(item.value) + '</div>' +
+        '</div>'
+      ).join('');
+    }
+
+    function renderDonutChart(targetEl, rows, emptyText) {
+      const items = (rows || []).filter((item) => Number(item.calls || 0) > 0);
+      if (!items.length) {
+        targetEl.innerHTML = '<div class="historyEmpty">' + escapeHtml(emptyText) + '</div>';
+        return;
+      }
+      const palette = ['#6ea8fe','#43d17c','#ffcc66','#ff7a7a','#d69cff','#64d2ff','#f59e0b','#34d399'];
+      const top = items.slice(0, 6).map((item) => ({ label: item.label || item.email || item.profileId || '未知', value: Number(item.calls || 0) || 0 }));
+      const rest = items.slice(6).reduce((sum, item) => sum + (Number(item.calls || 0) || 0), 0);
+      if (rest > 0) top.push({ label: '其他', value: rest });
+      const total = top.reduce((sum, item) => sum + item.value, 0) || 1;
+      let current = 0;
+      const gradient = top.map((item, index) => {
+        const start = (current / total) * 360;
+        current += item.value;
+        const end = (current / total) * 360;
+        return palette[index % palette.length] + ' ' + start.toFixed(1) + 'deg ' + end.toFixed(1) + 'deg';
+      }).join(', ');
+      targetEl.innerHTML = '' +
+        '<div class="donutWrap">' +
+          '<div class="donut" style="background:conic-gradient(' + gradient + ')"></div>' +
+          '<div class="legend">' + top.map((item, index) => '' +
+            '<div class="legendRow">' +
+              '<div class="legendLeft"><span class="swatch" style="background:' + palette[index % palette.length] + '"></span><span>' + escapeHtml(item.label) + '</span></div>' +
+              '<div>' + escapeHtml(formatMetricNumber(item.value)) + ' 次</div>' +
+            '</div>'
+          ).join('') + '</div>' +
+        '</div>';
+    }
+
+    function renderHistoryTrend(windowData) {
+      const rows = windowData?.days || [];
+      if (!rows.length) {
+        historyTrendEl.innerHTML = '<div class="historyEmpty">暂无趋势数据。</div>';
+        historyActiveDatesEl.textContent = '';
+        return;
+      }
+      const maxCalls = Math.max(...rows.map((item) => Number(item.totalCalls || 0) || 0), 1);
+      historyTrendEl.innerHTML = rows.map((item) => {
+        const height = Math.max(6, Math.round(((Number(item.totalCalls || 0) || 0) / maxCalls) * 120));
+        const label = item.dateKey.slice(5).replace('-', '/');
+        return '' +
+          '<div class="trendBarCol" title="' + escapeHtml(item.dateKey + ' · 调用 ' + (item.totalCalls || 0) + ' 次 · tokens ' + (item.totalTokens || 0)) + '">' +
+            '<div class="trendBar" style="height:' + height + 'px;opacity:' + ((item.totalCalls || 0) > 0 ? '1' : '0.25') + '"></div>' +
+            '<div class="trendLabel">' + escapeHtml(label) + '</div>' +
+          '</div>';
+      }).join('');
+      historyActiveDatesEl.textContent = (windowData.activeDates || []).slice(0, 6).join(' · ');
+    }
+
+    function renderPivotTable(data) {
+      const rows = currentPivotDimension === 'space'
+        ? (data.bySpace || [])
+        : currentPivotDimension === 'channel'
+          ? (data.byChannel || [])
+          : (data.byProfile || []);
+      const labelOf = (item) => currentPivotDimension === 'space'
+        ? (item.label || item.spaceLabel || item.key || '未识别空间')
+        : currentPivotDimension === 'channel'
+          ? (item.label || item.key || 'unknown')
+          : (item.email || item.profileId || '未识别账号');
+      if (!rows.length) {
+        historyPivotEl.innerHTML = '<div class="historyEmpty">这一天还没有可透视的数据。</div>';
+        return;
+      }
+      const totalCalls = rows.reduce((sum, item) => sum + (Number(item.calls || 0) || 0), 0) || 1;
+      historyPivotEl.innerHTML = '' +
+        '<table class="pivotTable">' +
+          '<thead><tr><th>' + (currentPivotDimension === 'space' ? '空间' : currentPivotDimension === 'channel' ? '渠道' : '账号') + '</th><th>调用</th><th>Tokens</th><th>成本</th><th>占比</th></tr></thead>' +
+          '<tbody>' + rows.map((item) => '' +
+            '<tr>' +
+              '<td>' + escapeHtml(labelOf(item)) + '</td>' +
+              '<td>' + escapeHtml(formatMetricNumber(item.calls || 0)) + '</td>' +
+              '<td>' + escapeHtml(formatMetricNumber(item.totalTokens || 0)) + '</td>' +
+              '<td>' + escapeHtml(item.totalCostText || (item.totalCost ? ('$' + Number(item.totalCost).toFixed(4)) : '—')) + '</td>' +
+              '<td>' + escapeHtml((((Number(item.calls || 0) || 0) / totalCalls) * 100).toFixed(1) + '%') + '</td>' +
+            '</tr>'
+          ).join('') + '</tbody>' +
+        '</table>';
+    }
+
+    function renderPivotButtons() {
+      pivotProfilesBtn.classList.toggle('active', currentPivotDimension === 'profile');
+      pivotSpacesBtn.classList.toggle('active', currentPivotDimension === 'space');
+      pivotChannelsBtn.classList.toggle('active', currentPivotDimension === 'channel');
+    }
+
     function historyProfileCard(item) {
       const tags = [
         badge('调用 ' + item.calls + ' 次'),
         badge('成功 ' + item.okCalls, 'good'),
       ];
       if (item.errorCalls > 0) tags.push(badge('异常 ' + item.errorCalls, 'warn'));
+      if (item.totalTokens > 0) tags.push(badge('tokens ' + item.totalTokens));
       return '' +
         '<div class="historyItem">' +
           '<div class="historyItemTitle">' +
             '<div><div class="title" style="font-size:16px">' + escapeHtml(item.email || item.profileId) + '</div><div class="muted"><code>' + escapeHtml(item.profileId) + '</code></div></div>' +
-            '<div><strong>' + escapeHtml(item.totalDurationText) + '</strong></div>' +
+            '<div><strong>' + escapeHtml(item.totalCostText || item.totalDurationText || '—') + '</strong></div>' +
           '</div>' +
           '<div class="tags">' + tags.join('') + '</div>' +
-          '<div class="historyMeta">最近一次：' + escapeHtml(item.lastAtText || '未知') + (item.accountId ? (' · accountId ' + escapeHtml(item.accountId)) : '') + '</div>' +
+          '<div class="historyMeta">最近一次：' + escapeHtml(item.lastAtText || '未知') + (item.accountId ? (' · accountId ' + escapeHtml(item.accountId)) : '') + (item.totalCostText ? (' · 成本 ' + escapeHtml(item.totalCostText)) : '') + '</div>' +
         '</div>';
     }
 
@@ -1137,13 +1930,14 @@ const HTML = `<!doctype html>
         item.model || null,
         item.messageChannel || null,
         item.totalTokens ? ('tokens ' + item.totalTokens) : null,
+        item.costTotal ? ('cost $' + Number(item.costTotal).toFixed(4)) : null,
         item.sessionKey ? ('session ' + item.sessionKey) : null,
       ].filter(Boolean).join(' · ');
       return '' +
         '<div class="historyItem">' +
           '<div class="historyItemTitle">' +
             '<div><div class="title" style="font-size:15px">' + escapeHtml(item.timeText) + ' · ' + escapeHtml(item.email || item.profileId) + '</div><div class="muted">' + escapeHtml(resultText(item.result)) + (item.stopReason ? (' · ' + escapeHtml(item.stopReason)) : '') + '</div></div>' +
-            '<div><strong>' + escapeHtml(item.durationText || formatDurationShort(item.durationMs)) + '</strong></div>' +
+            '<div><strong>' + escapeHtml(item.costTotal ? ('$' + Number(item.costTotal).toFixed(4)) : (item.durationText || formatDurationShort(item.durationMs) || '—')) + '</strong></div>' +
           '</div>' +
           '<div class="historyMeta"><code>' + escapeHtml(item.profileId) + '</code></div>' +
           '<div class="historyMeta">' + escapeHtml(meta || '无附加信息') + '</div>' +
@@ -1153,8 +1947,19 @@ const HTML = `<!doctype html>
     async function loadHistory(dateKey = currentHistoryDateKey) {
       currentHistoryDateKey = dateKey || todayDateKey();
       historyDateInputEl.value = currentHistoryDateKey;
-      const data = await api('/api/call-history?date=' + encodeURIComponent(currentHistoryDateKey));
-      historySummaryEl.textContent = data.dateKey + ' · 调用 ' + data.totalCalls + ' 次 · 总时长 ' + data.totalDurationText + ' · 账号 ' + data.profileCount + ' 个';
+      const [data, windowData] = await Promise.all([
+        api('/api/call-history?date=' + encodeURIComponent(currentHistoryDateKey)),
+        api('/api/call-history-window?days=14&endDate=' + encodeURIComponent(currentHistoryDateKey)),
+      ]);
+      const sourceText = data.source === 'session-transcript' ? '来源：真实 session 记录（含历史归档）' : '来源：usage 日志';
+      historySummaryEl.textContent = data.dateKey + ' · 调用 ' + data.totalCalls + ' 次 · tokens ' + formatMetricNumber(data.totalTokens || 0) + (data.totalCostText ? (' · 成本 ' + data.totalCostText) : '') + ' · 账号 ' + data.profileCount + ' 个 · ' + sourceText;
+      renderHistoryOverview(data);
+      renderHistoryTrend(windowData);
+      renderDonutChart(historySpaceChartEl, data.bySpace, '这一天还没有空间分布数据。');
+      renderDonutChart(historyChannelChartEl, data.byChannel, '这一天还没有渠道分布数据。');
+      renderDonutChart(historyProfileChartEl, data.byProfile, '这一天还没有账号分布数据。');
+      renderPivotButtons();
+      renderPivotTable(data);
       historyProfilesEl.innerHTML = (data.byProfile || []).length
         ? data.byProfile.map(historyProfileCard).join('')
         : '<div class="historyEmpty">这一天还没有记录到 Codex 实际调用。</div>';
@@ -1216,6 +2021,18 @@ const HTML = `<!doctype html>
     });
     historyDateInputEl.addEventListener('change', async () => {
       await loadHistory(historyDateInputEl.value || todayDateKey());
+    });
+    pivotProfilesBtn.addEventListener('click', async () => {
+      currentPivotDimension = 'profile';
+      await loadHistory(currentHistoryDateKey);
+    });
+    pivotSpacesBtn.addEventListener('click', async () => {
+      currentPivotDimension = 'space';
+      await loadHistory(currentHistoryDateKey);
+    });
+    pivotChannelsBtn.addEventListener('click', async () => {
+      currentPivotDimension = 'channel';
+      await loadHistory(currentHistoryDateKey);
     });
     submitCallbackBtn.addEventListener('click', async () => {
       const callbackUrl = (callbackInputEl.value || '').trim();
@@ -1291,11 +2108,30 @@ const server = http.createServer(async (req, res) => {
       if (!body.profileId) return json(res, 400, { error: '缺少 profileId' });
       return json(res, 200, promoteProfile(body.profileId));
     }
+    if (req.method === 'POST' && url.pathname === '/api/profile/hide') {
+      const body = await readJsonBody(req);
+      if (!body.profileId) return json(res, 400, { error: '缺少 profileId' });
+      return json(res, 200, hideProfile(body.profileId));
+    }
+    if (req.method === 'POST' && url.pathname === '/api/profile/restore') {
+      const body = await readJsonBody(req);
+      if (!body.profileId) return json(res, 400, { error: '缺少 profileId' });
+      return json(res, 200, restoreProfile(body.profileId));
+    }
+    if (req.method === 'POST' && url.pathname === '/api/profile/delete') {
+      const body = await readJsonBody(req);
+      if (!body.profileId) return json(res, 400, { error: '缺少 profileId' });
+      if (body.confirm !== true) return json(res, 400, { error: '缺少 confirm=true' });
+      return json(res, 200, deleteProfile(body.profileId, body.confirm));
+    }
     if (req.method === 'POST' && url.pathname === '/api/usage/refresh') {
       return json(res, 200, await refreshUsageSnapshot());
     }
     if (req.method === 'GET' && url.pathname === '/api/call-history') {
       return json(res, 200, readCodexCallHistory(url.searchParams.get('date')));
+    }
+    if (req.method === 'GET' && url.pathname === '/api/call-history-window') {
+      return json(res, 200, readCodexHistoryWindow(url.searchParams.get('days'), url.searchParams.get('endDate')));
     }
     return json(res, 404, { error: 'not found' });
   } catch (err) {
