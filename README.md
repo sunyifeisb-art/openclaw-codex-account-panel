@@ -62,9 +62,9 @@
 
 ![OpenClaw Codex Panel preview](./docs/panel-preview-redacted-v3.png)
 
-### 调用分析仪表盘（2026-03-24 更新）
+### 调用分析仪表盘（2026-03-24 更新，邮箱已打码）
 
-![OpenClaw Codex Panel analytics preview](./docs/panel-preview-analytics-20260324.png)
+![OpenClaw Codex Panel analytics preview](./docs/panel-preview-analytics-redacted-20260324.png)
 
 ## 目录结构
 
