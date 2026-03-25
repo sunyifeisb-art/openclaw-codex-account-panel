@@ -8,6 +8,7 @@ const PROVIDER = 'openai-codex';
 const AUTH_PATH = path.join(os.homedir(), '.openclaw/agents/main/agent/auth-profiles.json');
 const CHROME_APP = process.env.OPENCLAW_CODEX_BROWSER_APP || 'Google Chrome';
 const DISABLE_AUTO_BROWSER = process.env.OPENCLAW_CODEX_DISABLE_AUTO_BROWSER !== '0';
+const FORCE_MANUAL_OAUTH = process.env.OPENCLAW_CODEX_FORCE_MANUAL_OAUTH !== '0';
 const args = new Set(process.argv.slice(2));
 
 if (args.has('--help') || args.has('-h')) {
@@ -23,6 +24,7 @@ if (args.has('--help') || args.has('-h')) {
 可选环境变量:
   OPENCLAW_CODEX_BROWSER_APP=Safari|Google Chrome|Arc
   OPENCLAW_CODEX_DISABLE_AUTO_BROWSER=1   # 默认开启；阻止 openclaw 再拉系统默认浏览器
+  OPENCLAW_CODEX_FORCE_MANUAL_OAUTH=1     # 默认开启；强制走“打印 URL + 手动回调”模式，避免再自动拉起 Edge/默认浏览器
 `);
   process.exit(0);
 }
@@ -116,6 +118,7 @@ async function main() {
   console.log(`- 浏览器: ${CHROME_APP}`);
   console.log(`- 隔离配置目录: ${profileDir}`);
   console.log(`- 禁用系统默认浏览器自动拉起: ${DISABLE_AUTO_BROWSER ? '是' : '否'}`);
+  console.log(`- 强制手动 OAuth 模式: ${FORCE_MANUAL_OAUTH ? '是' : '否'}`);
   console.log(`- 登录前 default: ${beforeDefault.email || 'unknown'} / ${beforeDefault.accountId || 'unknown'}`);
 
   const openShimDir = DISABLE_AUTO_BROWSER ? createOpenShimDir() : null;
@@ -126,6 +129,11 @@ async function main() {
     ...(openShimDir
       ? {
           PATH: `${openShimDir}:${process.env.PATH || ''}`,
+        }
+      : {}),
+    ...(FORCE_MANUAL_OAUTH
+      ? {
+          SSH_TTY: process.env.SSH_TTY || 'openclaw-codex-panel-manual-oauth',
         }
       : {}),
   };

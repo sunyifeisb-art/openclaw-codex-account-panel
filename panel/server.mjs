@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
+import { syncProviderAcrossAgents } from './auth-store-sync.mjs';
 
 const PORT = Number(process.env.CODEX_PANEL_PORT || 7071);
 const WORKSPACE = process.env.OPENCLAW_WORKSPACE || '/Users/xiangyang/.openclaw/workspace';
@@ -22,6 +23,21 @@ const USAGE_TIMEOUT_MS = Number(process.env.CODEX_PANEL_USAGE_TIMEOUT_MS || 1500
 const WEEKLY_RESET_GAP_SECONDS = 6 * 24 * 3600;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function syncOpenAICodexStores() {
+  try {
+    return syncProviderAcrossAgents({
+      sourcePath: AUTH_PATH,
+      agentsRoot: AGENTS_ROOT,
+      providerId: 'openai-codex',
+    });
+  } catch (err) {
+    console.warn('[codex-panel] syncOpenAICodexStores failed:', err?.message || String(err));
+    return { updated: [], skipped: [] };
+  }
+}
+
+syncOpenAICodexStores();
 
 function json(res, code, payload) {
   res.writeHead(code, {
@@ -344,6 +360,7 @@ function writeStore(store) {
   const backup = `${AUTH_PATH}.panel-backup-${Date.now()}`;
   fs.copyFileSync(AUTH_PATH, backup);
   fs.writeFileSync(AUTH_PATH, JSON.stringify(store, null, 2) + '\n');
+  syncOpenAICodexStores();
   return backup;
 }
 
@@ -1307,7 +1324,7 @@ function detectLoginRunningFromLog(logText) {
   if (/❌/i.test(text)) return false;
   if (/✅ 已固化成功/i.test(text)) return false;
   if (/\[terminal-exit\]/i.test(text)) return false;
-  if (/Complete sign-in in browser|Paste the authorization code|已捕获登录链接|已在 Terminal/i.test(text)) return true;
+  if (/Complete sign-in in browser|Paste the authorization code|Open this URL in your LOCAL browser|已捕获登录链接|已在 Terminal/i.test(text)) return true;
   return false;
 }
 
@@ -1319,7 +1336,7 @@ function getLoginHint(logText) {
       text: '浏览器已登录，但当前还在等你粘贴 localhost 回调链接。',
     };
   }
-  if (/Complete sign-in in browser/i.test(text)) {
+  if (/Complete sign-in in browser|Open this URL in your LOCAL browser/i.test(text)) {
     return {
       code: 'browser-login',
       text: '正在等浏览器完成登录；如果长时间没结束，可把 localhost 回调链接粘到下面。',
@@ -1339,7 +1356,7 @@ function getLoginHint(logText) {
 
 function getAuthProfilesMtime() {
   try {
-    return Number(fs.statSync(AUTH_STORE).mtimeMs || 0) || 0;
+    return Number(fs.statSync(AUTH_PATH).mtimeMs || 0) || 0;
   } catch {
     return 0;
   }
@@ -1386,14 +1403,37 @@ function readLogTail(maxBytes = 12000) {
 
 function launchTerminalLogin(targetEmail = '') {
   const safeTargetEmail = String(targetEmail || '').trim();
+  const closeTerminalScript = [
+    'osascript',
+    "-e 'tell application \"Terminal\"'",
+    "-e 'repeat with w in windows'",
+    "-e 'repeat with t in tabs of w'",
+    "-e \"if (tty of t) is \\\"$AUTO_CLOSE_TTY\\\" then\"",
+    "-e 'if (count of tabs of w) > 1 then'",
+    "-e 'close t saving no'",
+    "-e 'else'",
+    "-e 'close w saving no'",
+    "-e 'end if'",
+    "-e 'return'",
+    "-e 'end if'",
+    "-e 'end repeat'",
+    "-e 'end repeat'",
+    "-e 'end tell' >/dev/null 2>&1 || true",
+  ].join(' ');
+
   const shellCommand = [
+    'set -o pipefail',
     `cd ${JSON.stringify(WORKSPACE)}`,
+    'AUTO_CLOSE_TTY="$(tty)"',
     `printf '已在 Terminal 发起 Codex 新账号登录流程\\n' > ${JSON.stringify(LOGIN_LOG_PATH)}`,
     ...(safeTargetEmail
       ? [`printf '目标账号: ${safeTargetEmail}\\n' | tee -a ${JSON.stringify(LOGIN_LOG_PATH)}`]
       : []),
     `node ${JSON.stringify(LOGIN_SCRIPT)} 2>&1 | tee -a ${JSON.stringify(LOGIN_LOG_PATH)}`,
+    'LOGIN_EXIT_CODE=$?',
     `printf '\\n[terminal-exit] %s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" | tee -a ${JSON.stringify(LOGIN_LOG_PATH)}`,
+    `if [ "$LOGIN_EXIT_CODE" -eq 0 ]; then ${closeTerminalScript}; fi`,
+    'exit "$LOGIN_EXIT_CODE"',
   ].join('; ');
 
   const osa = `tell application "Terminal"
@@ -1497,8 +1537,10 @@ function promoteProfile(profileId) {
   }
   const order = getCodexOrder(store);
   setCodexOrder(store, [profileId, ...order.filter((id) => id !== profileId)]);
+  store.lastGood = store.lastGood || {};
+  store.lastGood['openai-codex'] = profileId;
   const backup = writeStore(store);
-  return { backup, order: getCodexOrder(store) };
+  return { backup, order: getCodexOrder(store), selectedProfileId: profileId };
 }
 
 function hideProfile(profileId) {
@@ -1706,6 +1748,10 @@ const HTML = `<!doctype html>
     .donut::after{content:'';position:absolute;inset:22px;border-radius:50%;background:var(--card-2);border:1px solid var(--line)}
     .legend{display:flex;flex-direction:column;gap:8px;min-width:220px;flex:1}
     .legendRow{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted)}
+    .legendRow.interactive,.donut.interactive{cursor:pointer;transition:transform .12s ease,opacity .12s ease,box-shadow .12s ease}
+    .legendRow.interactive:hover,.donut.interactive:hover{opacity:.92}
+    .legendRow.interactive:active,.donut.interactive:active{transform:scale(.985)}
+    .legendHint{font-size:12px;color:var(--muted);margin-top:8px}
     .legendLeft{display:flex;align-items:center;gap:8px;min-width:0}.swatch{width:10px;height:10px;border-radius:999px;flex:0 0 auto}
     .trendCard{border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--card-2);margin-bottom:16px}
     .trendBars{display:flex;align-items:flex-end;gap:8px;height:150px;margin-top:12px;overflow-x:auto;padding-bottom:8px}
@@ -1920,6 +1966,7 @@ const HTML = `<!doctype html>
     let currentThemeMode = 'system';
     let currentHistoryEvents = [];
     let currentHistoryEventsPage = 1;
+    let currentHistoryPayload = null;
     const HISTORY_EVENTS_PAGE_SIZE = 6;
 
     async function api(url, options = {}) {
@@ -2318,7 +2365,7 @@ const HTML = `<!doctype html>
       ).join('');
     }
 
-    function renderDonutChart(targetEl, rows, emptyText) {
+    function renderDonutChart(targetEl, rows, emptyText, dimension) {
       const items = (rows || []).filter((item) => Number(item.calls || 0) > 0);
       if (!items.length) {
         targetEl.innerHTML = '<div class="historyEmpty">' + escapeHtml(emptyText) + '</div>';
@@ -2338,14 +2385,19 @@ const HTML = `<!doctype html>
       }).join(', ');
       targetEl.innerHTML = '' +
         '<div class="donutWrap">' +
-          '<div class="donut" style="background:conic-gradient(' + gradient + ')"></div>' +
+          '<div class="donut interactive" data-donut-dimension="' + escapeHtml(dimension || '') + '" title="点击切换下方数据透视" style="background:conic-gradient(' + gradient + ')"></div>' +
           '<div class="legend">' + top.map((item, index) => '' +
-            '<div class="legendRow">' +
+            '<div class="legendRow interactive" data-donut-dimension="' + escapeHtml(dimension || '') + '" title="点击切换下方数据透视">' +
               '<div class="legendLeft"><span class="swatch" style="background:' + palette[index % palette.length] + '"></span><span>' + escapeHtml(item.label) + '</span></div>' +
               '<div>' + escapeHtml(formatMetricNumber(item.value)) + ' 次</div>' +
             '</div>'
-          ).join('') + '</div>' +
+          ).join('') +
+          '<div class="legendHint">点击图表或图例，可切换下方透视维度</div>' +
+          '</div>' +
         '</div>';
+      targetEl.querySelectorAll('[data-donut-dimension]').forEach((node) => {
+        node.addEventListener('click', () => setPivotDimension(dimension));
+      });
     }
 
     function renderHistoryTrend(windowData) {
@@ -2403,6 +2455,15 @@ const HTML = `<!doctype html>
       pivotProfilesBtn.classList.toggle('active', currentPivotDimension === 'profile');
       pivotSpacesBtn.classList.toggle('active', currentPivotDimension === 'space');
       pivotChannelsBtn.classList.toggle('active', currentPivotDimension === 'channel');
+    }
+
+    function setPivotDimension(dimension, { scroll = true } = {}) {
+      currentPivotDimension = ['profile', 'space', 'channel'].includes(dimension) ? dimension : 'profile';
+      renderPivotButtons();
+      if (currentHistoryPayload) renderPivotTable(currentHistoryPayload);
+      if (scroll && historyPivotEl) {
+        historyPivotEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
     }
 
     function historyProfileCard(item) {
@@ -2463,11 +2524,12 @@ const HTML = `<!doctype html>
           ]);
       const sourceText = data.source === 'session-transcript' ? '来源：真实 session 记录（含历史归档）' : '来源：usage 日志';
       historySummaryEl.textContent = (currentHistoryMode === 'month' ? data.monthKey : data.dateKey) + ' · 调用 ' + data.totalCalls + ' 次 · tokens ' + formatMetricNumber(data.totalTokens || 0) + (data.totalCostText ? (' · 成本 ' + data.totalCostText) : '') + ' · 账号 ' + data.profileCount + ' 个 · ' + sourceText;
+      currentHistoryPayload = data;
       renderHistoryOverview(data);
       renderHistoryTrend(windowData);
-      renderDonutChart(historySpaceChartEl, data.bySpace, currentHistoryMode === 'month' ? '这个月还没有空间分布数据。' : '这一天还没有空间分布数据。');
-      renderDonutChart(historyChannelChartEl, data.byChannel, currentHistoryMode === 'month' ? '这个月还没有渠道分布数据。' : '这一天还没有渠道分布数据。');
-      renderDonutChart(historyProfileChartEl, data.byProfile, currentHistoryMode === 'month' ? '这个月还没有账号分布数据。' : '这一天还没有账号分布数据。');
+      renderDonutChart(historySpaceChartEl, data.bySpace, currentHistoryMode === 'month' ? '这个月还没有空间分布数据。' : '这一天还没有空间分布数据。', 'space');
+      renderDonutChart(historyChannelChartEl, data.byChannel, currentHistoryMode === 'month' ? '这个月还没有渠道分布数据。' : '这一天还没有渠道分布数据。', 'channel');
+      renderDonutChart(historyProfileChartEl, data.byProfile, currentHistoryMode === 'month' ? '这个月还没有账号分布数据。' : '这一天还没有账号分布数据。', 'profile');
       renderPivotButtons();
       renderPivotTable(data);
       historyProfilesEl.innerHTML = (data.byProfile || []).length
@@ -2547,20 +2609,14 @@ const HTML = `<!doctype html>
     billModeMonthBtn.addEventListener('click', async () => {
       await loadHistory(currentHistoryMonthKey, 'month');
     });
-    pivotProfilesBtn.addEventListener('click', async () => {
-      currentPivotDimension = 'profile';
-      applyHistoryMode('day');
-      await loadHistory(currentHistoryDateKey, currentHistoryMode);
+    pivotProfilesBtn.addEventListener('click', () => {
+      setPivotDimension('profile', { scroll: false });
     });
-    pivotSpacesBtn.addEventListener('click', async () => {
-      currentPivotDimension = 'space';
-      applyHistoryMode('day');
-      await loadHistory(currentHistoryDateKey, currentHistoryMode);
+    pivotSpacesBtn.addEventListener('click', () => {
+      setPivotDimension('space', { scroll: false });
     });
-    pivotChannelsBtn.addEventListener('click', async () => {
-      currentPivotDimension = 'channel';
-      applyHistoryMode('day');
-      await loadHistory(currentHistoryDateKey, currentHistoryMode);
+    pivotChannelsBtn.addEventListener('click', () => {
+      setPivotDimension('channel', { scroll: false });
     });
     submitCallbackBtn.addEventListener('click', async () => {
       const callbackUrl = (callbackInputEl.value || '').trim();

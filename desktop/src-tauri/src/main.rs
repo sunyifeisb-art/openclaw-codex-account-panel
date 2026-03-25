@@ -17,7 +17,8 @@ use tauri::{
   image::Image,
   menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
   tray::TrayIconBuilder,
-  AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry,
+  AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+  Wry,
 };
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
@@ -148,6 +149,10 @@ fn panel_preferences_path() -> Result<PathBuf, String> {
   Ok(resolve_workspace_root()?.join("data").join("codex-panel-preferences.json"))
 }
 
+fn panel_server_pid_path() -> Result<PathBuf, String> {
+  Ok(resolve_workspace_root()?.join("codex-account-panel").join("data").join("codex-account-panel.pid"))
+}
+
 fn is_port_open() -> bool {
   TcpStream::connect(("127.0.0.1", PORT)).is_ok()
 }
@@ -232,6 +237,13 @@ fn stop_stale_panel_server(pid_path: &PathBuf) {
         thread::sleep(Duration::from_millis(250));
       }
     }
+  }
+}
+
+fn stop_panel_server_on_exit() {
+  if let Ok(pid_path) = panel_server_pid_path() {
+    stop_stale_panel_server(&pid_path);
+    let _ = fs::remove_file(pid_path);
   }
 }
 
@@ -332,7 +344,7 @@ fn normalize_theme_mode(value: &str) -> String {
 
 fn derive_launch_shape(_launch_mode: &str) -> LaunchShape {
   LaunchShape {
-    shows_window_on_launch: false,
+    shows_window_on_launch: true,
     enables_menu_bar: true,
   }
 }
@@ -372,13 +384,16 @@ fn write_panel_preferences(app: &AppHandle<Wry>, next: &PanelPreferences) -> Res
 fn panel_url() -> Result<WebviewUrl, tauri::Error> {
   let startup_ok = ensure_server_running().is_ok();
   if startup_ok {
-    let parsed = format!("http://127.0.0.1:{PORT}")
-      .parse::<Url>()
-      .map_err(|e| tauri::Error::Io(std::io::Error::other(e.to_string())))?;
-    Ok(WebviewUrl::External(parsed))
+    Ok(WebviewUrl::External(external_panel_url()?))
   } else {
-    Ok(WebviewUrl::App("help.html".into()))
+    Ok(WebviewUrl::App("index.html".into()))
   }
+}
+
+fn external_panel_url() -> Result<Url, tauri::Error> {
+  format!("http://127.0.0.1:{PORT}")
+    .parse::<Url>()
+    .map_err(|e| tauri::Error::Io(std::io::Error::other(e.to_string())))
 }
 
 fn create_main_window(app: &AppHandle<Wry>) -> tauri::Result<WebviewWindow<Wry>> {
@@ -627,6 +642,25 @@ fn spawn_tray_refresher(app: AppHandle<Wry>) {
   });
 }
 
+fn spawn_panel_ready_redirect(app: AppHandle<Wry>) {
+  thread::spawn(move || {
+    for _ in 0..60 {
+      thread::sleep(Duration::from_secs(1));
+      if !(is_port_open() && is_panel_server_compatible()) {
+        continue;
+      }
+      let Ok(url) = external_panel_url() else {
+        break;
+      };
+      if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.navigate(url);
+        let _ = window.show();
+      }
+      break;
+    }
+  });
+}
+
 fn apply_theme_mode(app: &AppHandle<Wry>, theme_mode: &str) -> Result<(), String> {
   let mut prefs = read_panel_preferences(app);
   prefs.theme_mode = normalize_theme_mode(theme_mode);
@@ -666,6 +700,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: MenuEvent) {
     ID_QUIT => {
       let state = app.state::<DesktopState>();
       state.allow_exit.store(true, Ordering::Relaxed);
+      stop_panel_server_on_exit();
       app.exit(0);
     }
     _ => {}
@@ -685,7 +720,6 @@ fn main() {
         if state.allow_exit.load(Ordering::Relaxed) {
           return;
         }
-        let _prefs = read_panel_preferences(&app);
         api.prevent_close();
         hide_main_window(&app);
       }
@@ -712,10 +746,20 @@ fn main() {
       }
       if shape.shows_window_on_launch {
         open_or_show_main_window(&app.handle())?;
+        spawn_panel_ready_redirect(app.handle().clone());
       }
 
       Ok(())
     })
-    .run(tauri::generate_context!())
-    .expect("error while running Codex account panel desktop app");
+    .build(tauri::generate_context!())
+    .expect("error while building Codex account panel desktop app")
+    .run(|app, event| {
+      if let RunEvent::ExitRequested { api, .. } = event {
+        let state = app.state::<DesktopState>();
+        state.allow_exit.store(true, Ordering::Relaxed);
+        stop_panel_server_on_exit();
+        let _ = app.cleanup_before_exit();
+        let _ = api;
+      }
+    });
 }

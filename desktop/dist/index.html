@@ -15,7 +15,7 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     .box {
-      max-width: 520px;
+      max-width: 560px;
       padding: 24px 28px;
       border: 1px solid #24304d;
       border-radius: 18px;
@@ -24,13 +24,35 @@
     }
     h1 { margin: 0 0 10px; font-size: 28px; }
     p { margin: 8px 0; color: #97a3bf; line-height: 1.6; }
+    .muted { color: #7f8ba7; font-size: 13px; }
   </style>
 </head>
 <body>
   <div class="box">
-    <h1>正在启动 Codex 面板…</h1>
-    <p>桌面 App 正在拉起本地服务并准备加载面板。</p>
-    <p>如果几秒后仍未自动进入，请关闭 App 重新打开一次。</p>
+    <h1>正在启动 OpenClaw Panel…</h1>
+    <p id="status">桌面 App 正在拉起本地服务，服务一就绪会自动进入主面板。</p>
+    <p class="muted">如果启动稍慢，就先停在这个页面；不再跳那个“已安装用户说明页”。</p>
   </div>
+  <script>
+    const PANEL_URL = 'http://127.0.0.1:7071';
+    const statusEl = document.getElementById('status');
+    let redirected = false;
+
+    async function tryOpenPanel() {
+      if (redirected) return;
+      try {
+        const res = await fetch(PANEL_URL + '/api/preferences', { cache: 'no-store' });
+        if (!res.ok) throw new Error('panel not ready');
+        redirected = true;
+        statusEl.textContent = '本地服务已就绪，正在进入主面板…';
+        window.location.replace(PANEL_URL);
+      } catch (_err) {
+        statusEl.textContent = '本地服务还没起来，继续等待中…';
+      }
+    }
+
+    tryOpenPanel();
+    setInterval(tryOpenPanel, 1200);
+  </script>
 </body>
 </html>

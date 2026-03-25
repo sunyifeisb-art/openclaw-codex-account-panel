@@ -29,6 +29,7 @@
       "minimumSystemVersion": "12.0"
     },
     "resources": {
+      "../../codex-account-panel/auth-store-sync.mjs": "panel/auth-store-sync.mjs",
       "../../codex-account-panel/server.mjs": "panel/server.mjs",
       "../../../scripts/openclaw_codex_add_profile.mjs": "scripts/openclaw_codex_add_profile.mjs"
     }
